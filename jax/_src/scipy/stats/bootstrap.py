@@ -124,7 +124,7 @@ def _percentile_along_axis(theta_hat_b, alpha):
   for i in range(theta_hat_b.ndim - 1):
     vmap_percentile = vmap(vmap_percentile)
   percentiles = vmap_percentile(theta_hat_b, alpha)
-  return percentiles[()]
+  return percentiles
 
 
 def bootstrap_iv(key, data, statistic, vectorized, paired, axis, confidence_level, n_resamples, method):
