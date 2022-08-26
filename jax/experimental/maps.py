@@ -39,7 +39,9 @@ from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src.config import config
 from jax.errors import JAXTypeError
-from jax.experimental.global_device_array import GlobalDeviceArray, _get_array_mapping
+from jax.experimental.array import Array
+from jax.experimental.global_device_array import GlobalDeviceArray
+from jax.experimental.sharding import MeshPspecSharding
 from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import pxla
@@ -48,7 +50,7 @@ from jax.interpreters import batching
 from jax.interpreters import ad
 from jax._src.lib import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from jax._src.util import (safe_map, safe_zip, HashableFunction, unzip2,
+from jax._src.util import (safe_map, safe_zip, HashableFunction, unzip2, unzip3,
                            as_hashable_function, distributed_debug_log,
                            tuple_insert, moveaxis, split_list, wrap_name,
                            merge_lists, partition_list)
@@ -154,7 +156,7 @@ class SerialLoop:
 def serial_loop(name: ResourceAxisName, length: int):
   """Define a serial loop resource to be available in scope of this context manager.
 
-  This is similar to :py:func:`mesh` in that it extends the resource
+  This is similar to :py:class:`Mesh` in that it extends the resource
   environment with a resource called ``name``. But, any use of this resource
   axis in ``axis_resources`` argument of :py:func:`xmap` will cause the
   body of :py:func:`xmap` to get executed ``length`` times with each execution
@@ -254,7 +256,7 @@ def _parse_entry(arg_name, entry):
     raise TypeError(f"""\
 Value mapping specification in xmap {arg_name} pytree can be either:
 - lists of axis names (possibly ending with the ellipsis object: ...)
-- dictionaries that map positional axes (integers) to axis names (e.g. {2: 'name'})
+- dictionaries that map positional axes (integers) to axis names (e.g. {{2: 'name'}})
 but got: {entry}""")
   if len(result) != num_mapped_dims:
     raise ValueError(f"Named axes should be unique within each {arg_name} argument "
@@ -330,7 +332,7 @@ def xmap(fun: Callable,
   :py:func:`vmap`. However, this behavior can be further customized by the
   ``axis_resources`` argument.  When specified, each axis introduced by
   :py:func:`xmap` can be assigned to one or more *resource axes*. Those include
-  the axes of the hardware mesh, as defined by the :py:func:`mesh` context
+  the axes of the hardware mesh, as defined by the :py:class:`Mesh` context
   manager. Each value that has a named axis in its ``named_shape`` will be
   partitioned over all mesh axes that axis is assigned to. Hence,
   :py:func:`xmap` can be seen as an alternative to :py:func:`pmap` that also
@@ -423,7 +425,7 @@ def xmap(fun: Callable,
   to implement a distributed matrix-multiplication in just a few lines of code::
 
     devices = np.array(jax.devices())[:4].reshape((2, 2))
-    with mesh(devices, ('x', 'y')):  # declare a 2D mesh with axes 'x' and 'y'
+    with Mesh(devices, ('x', 'y')):  # declare a 2D mesh with axes 'x' and 'y'
       distributed_out = xmap(
         jnp.vdot,
         in_axes=({0: 'left'}, {1: 'right'}),
@@ -455,7 +457,6 @@ def xmap(fun: Callable,
     specified. This is in line with the current multi-host :py:func:`pmap`
     programming model.
   """
-  warn("xmap is an experimental feature and probably has bugs!")
   _check_callable(fun)
 
   if isinstance(in_axes, list) and not _is_axes_leaf(in_axes):
@@ -543,10 +544,13 @@ def xmap(fun: Callable,
       lambda: tuple(_flatten_axes("xmap out_axes", out_tree(), out_axes, tupled_args=False)),
       closure=(out_axes_entries, out_axes_treedef))
 
-    in_positional_semantics = tuple(
-        _PositionalSemantics.GLOBAL
-        if isinstance(a, GlobalDeviceArray) else _positional_semantics.val
-        for a in args_flat)
+    if config.jax_array:
+      in_positional_semantics = (_PositionalSemantics.GLOBAL,) * len(args_flat)
+    else:
+      in_positional_semantics = tuple(
+          _PositionalSemantics.GLOBAL
+          if isinstance(a, GlobalDeviceArray) else _positional_semantics.val
+          for a in args_flat)
     out_positional_semantics = _positional_semantics.val
 
     axis_resource_count = _get_axis_resource_count(
@@ -577,7 +581,7 @@ def xmap(fun: Callable,
                            f"which asserts that it should be of rank {spec.expected_rank}, "
                            f"but the argument has rank {arg.ndim} (and shape {arg.shape})")
 
-    _check_gda_xmap_partitioning(frozen_axis_resources, resource_env,
+    _check_gda_or_array_xmap_partitioning(frozen_axis_resources, resource_env,
                                  frozen_global_axis_sizes, in_axes_flat,
                                  in_positional_semantics, args_flat)
 
@@ -661,7 +665,6 @@ def make_xmap_callable(fun: lu.WrappedFun,
                        global_axis_sizes, axis_resources, resource_env, backend,
                        spmd_in_axes, spmd_out_axes_thunk, in_positional_semantics,
                        out_positional_semantics, *in_avals):
-  assert out_positional_semantics == _PositionalSemantics.LOCAL
   plan = EvaluationPlan.from_axis_resources(
       axis_resources, resource_env, global_axis_sizes, in_positional_semantics)
 
@@ -710,9 +713,13 @@ def make_xmap_callable(fun: lu.WrappedFun,
       tiling_method = pxla.TileManual(manual_mesh_axes)
     else:
       tiling_method = pxla.TileVectorize()
+    in_shardings = [MeshPspecSharding(mesh, pxla.array_mapping_to_axis_resources(i))
+                    for i in mesh_in_axes]
+    out_shardings = [MeshPspecSharding(mesh, pxla.array_mapping_to_axis_resources(o))
+                     for o in mesh_out_axes]
     return pxla.lower_mesh_computation(
         f, 'xmap', name, mesh,
-        mesh_in_axes, mesh_out_axes, donated_invars,
+        in_shardings, out_shardings, donated_invars,
         use_spmd_lowering, global_in_avals,
         tiling_method=tiling_method, in_is_global=in_is_global)
   else:
@@ -842,7 +849,10 @@ class XMapPrimitive(core.MapPrimitive):
     return trace.process_xmap(self, fun, tracers, params)
 
   def post_process(self, trace, out_tracers, params):
-    raise NotImplementedError
+    post_process = getattr(trace, 'post_process_xmap', None)
+    if post_process is None:
+      raise NotImplementedError
+    return post_process(self, out_tracers, params)
 
   def get_bind_params(self, params):
     new_params = dict(params)
@@ -923,10 +933,11 @@ ad.primitive_transposes[xmap_p] = _xmap_transpose
 
 
 def _typecheck_xmap(
-    *in_avals, call_jaxpr, name, in_axes, out_axes, donated_invars,
+    *in_atoms, call_jaxpr, name, in_axes, out_axes, donated_invars,
     global_axis_sizes, axis_resources, resource_env, backend,
     spmd_in_axes, spmd_out_axes, in_positional_semantics,
     out_positional_semantics):
+  in_avals = [x.aval for x in in_atoms]
   axis_resource_count = _get_axis_resource_count(
       axis_resources, resource_env, in_positional_semantics)
   local_axis_sizes = {
@@ -940,11 +951,8 @@ def _typecheck_xmap(
       raise core.JaxprTypeError(
         f"xmap passes operand {in_aval} to jaxpr expecting {binder_in_aval}")
 
-  mapped_in_avals = [_delete_aval_axes(a, a_in_axes, global_axis_sizes)
-                     for a, a_in_axes in zip(in_avals, in_axes)]
   with core.extend_axis_env_nd(global_axis_sizes.items()):
-    core._check_jaxpr(lambda: core.JaxprPpContext(), call_jaxpr,
-                      mapped_in_avals)
+    core._check_jaxpr(lambda: core.JaxprPpContext(), call_jaxpr)
 
   mapped_out_avals = [v.aval for v in call_jaxpr.outvars]
   out_avals = [_insert_aval_axes(a, a_out_axes, local_axis_sizes)
@@ -1011,10 +1019,9 @@ def _dynamic_jaxpr_process_xmap(self, primitive, f, tracers, params):
   mapped_in_avals = [_delete_aval_axes(a, a_in_axes, global_axis_sizes)
                      for a, a_in_axes in zip(in_avals, params['in_axes'])]
   with core.extend_axis_env_nd(global_axis_sizes.items()):
-    jaxpr, mapped_out_avals, consts = trace_to_subjaxpr_dynamic(
-        f, self.main, mapped_in_avals)
-  if jaxpr.effects:
-    raise NotImplementedError('Effects not supported in `xmap`.')
+    with core.new_sublevel():
+      jaxpr, mapped_out_avals, consts = trace_to_subjaxpr_dynamic(
+          f, self.main, mapped_in_avals)
   out_axes = params['out_axes_thunk']()
   if params['spmd_out_axes_thunk'] is not None:
     spmd_out_axes = params['spmd_out_axes_thunk']()
@@ -1052,7 +1059,7 @@ def _dynamic_jaxpr_process_xmap(self, primitive, f, tracers, params):
   del new_params['spmd_out_axes_thunk']
   eqn = new_jaxpr_eqn([*constvars, *invars], outvars, primitive,
                       new_params, call_jaxpr.effects, source_info)
-  self.frame.eqns.append(eqn)
+  self.frame.add_eqn(eqn)
   return out_tracers
 pe.DynamicJaxprTrace.process_xmap = _dynamic_jaxpr_process_xmap  # type: ignore
 
@@ -1064,7 +1071,7 @@ def _xmap_partial_eval_custom_params_updater(
   assert params_known['spmd_in_axes'] is None is params_known['spmd_out_axes']
   assert params_staged['spmd_in_axes'] is None is params_staged['spmd_out_axes']
 
-  # pruned inputs to jaxpr_known according to unks_in
+  # prune inputs to jaxpr_known according to unks_in
   donated_invars_known, _ = pe.partition_list(unks_in, params_known['donated_invars'])
   in_axes_known, _ = pe.partition_list(unks_in, params_known['in_axes'])
   if num_res == 0:
@@ -1226,6 +1233,17 @@ def _batch_trace_update_spmd_axes(
 
   return new_spmd_in_axes, new_spmd_out_axes_thunk
 
+def _axis_after_insertion(axis, inserted_named_axes):
+  for inserted_axis in sorted(inserted_named_axes.values()):
+    if inserted_axis >= axis:
+      break
+    axis += 1
+  return axis
+
+def _fmap_dims(axes, f):
+  return AxisNamePos(((name, f(axis)) for name, axis in axes.items()),
+                     user_repr=axes.user_repr)
+
 def _batch_trace_process_xmap(self, is_spmd, primitive, f: lu.WrappedFun, tracers, params):
   not_mapped = batching.not_mapped
   vals, dims = unzip2((t.val, t.batch_dim) for t in tracers)
@@ -1234,25 +1252,16 @@ def _batch_trace_process_xmap(self, is_spmd, primitive, f: lu.WrappedFun, tracer
     return primitive.bind(f, *vals, **params)
   else:
     assert len({x.shape[d] for x, d in zip(vals, dims) if d is not not_mapped}) == 1
-    def fmap_dims(axes, f):
-      return AxisNamePos(((name, f(axis)) for name, axis in axes.items()),
-                         user_repr=axes.user_repr)
     new_in_axes = tuple(
-      fmap_dims(in_axes, lambda a: a + (d is not not_mapped and d <= a))
+      _fmap_dims(in_axes, lambda a: a + (d is not not_mapped and d <= a))
       for d, in_axes in zip(dims, params['in_axes']))
     mapped_dims_in = tuple(
       d if d is not_mapped else d - sum(a < d for a in in_axis.values())
       for d, in_axis in zip(dims, params['in_axes']))
     f, mapped_dims_out = batching.batch_subtrace(f, self.main, mapped_dims_in)
     out_axes_thunk: Callable[[], Sequence[AxisNamePos]] = params['out_axes_thunk']
-    dims_out_thunk = lambda: tuple(d if d is not_mapped else axis_after_insertion(d, out_axes)
+    dims_out_thunk = lambda: tuple(d if d is not_mapped else _axis_after_insertion(d, out_axes)
                                    for d, out_axes in zip(mapped_dims_out(), out_axes_thunk()))
-    def axis_after_insertion(axis, inserted_named_axes):
-      for inserted_axis in sorted(inserted_named_axes.values()):
-        if inserted_axis >= axis:
-          break
-        axis += 1
-      return axis
     # NOTE: This assumes that the choice of the dimensions over which outputs
     #       are batched is entirely dependent on the function and not e.g. on the
     #       data or its shapes.
@@ -1260,7 +1269,7 @@ def _batch_trace_process_xmap(self, is_spmd, primitive, f: lu.WrappedFun, tracer
     def new_out_axes_thunk():
       return tuple(
         out_axes if d is not_mapped else
-        fmap_dims(out_axes, lambda a, nd=axis_after_insertion(d, out_axes): a + (nd <= a))
+        _fmap_dims(out_axes, lambda a, nd=_axis_after_insertion(d, out_axes): a + (nd <= a))
         for out_axes, d in zip(out_axes_thunk(), mapped_dims_out()))
 
     if not is_spmd:
@@ -1283,6 +1292,23 @@ batching.BatchTrace.process_xmap = partialmethod(_batch_trace_process_xmap, Fals
 pxla.SPMDBatchTrace.process_xmap = partialmethod(_batch_trace_process_xmap, True)  # type: ignore
 
 
+def _batch_trace_post_process_xmap(self, primitive, out_tracers, params):
+  not_mapped = batching.not_mapped
+  BT = batching.BatchTracer
+  vals, dims, srcs = unzip3((t.val, t.batch_dim, t.source_info) for t in out_tracers)
+  main = self.main
+  def todo(vals):
+    trace = main.with_cur_sublevel()
+    return [BT(trace, v, d if d is not_mapped else _axis_after_insertion(d, oa), s)
+            for v, d, oa, s in zip(vals, dims, params['out_axes_thunk'](), srcs)]
+  def out_axes_transform(out_axes):
+    return tuple(oa if d is not_mapped else
+                 _fmap_dims(oa, lambda a, nd=_axis_after_insertion(d, oa): a + (nd <= a))
+                 for oa, d in zip(out_axes, dims))
+  return vals, (todo, out_axes_transform)
+batching.BatchTrace.post_process_xmap = _batch_trace_post_process_xmap
+
+
 # -------- nested xmap handling --------
 
 def _xmap_lowering_rule(ctx, *args, **kwargs):
@@ -1293,6 +1319,8 @@ def _xmap_lowering_rule(ctx, *args, **kwargs):
       return _xmap_lowering_rule_spmd(ctx, *args, **kwargs)
   elif isinstance(ctx.module_context.axis_context, mlir.ReplicaAxisContext):
     return _xmap_lowering_rule_replica(ctx, *args, **kwargs)
+  elif isinstance(ctx.module_context.axis_context, mlir.ShardingContext):
+    raise ValueError('ShardingContext cannot be used with xmap.')
   else:
     raise AssertionError("Unrecognized axis context type!")
 mlir.register_lowering(xmap_p, _xmap_lowering_rule)
@@ -1347,11 +1375,8 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
     mlir.lower_fun(partial(_tile, in_axes=arg_in_axes,
                            axis_sizes=local_mesh_shape),
                    multiple_results=False)(
-          mlir.LoweringRuleContext(module_context=ctx.module_context,
-                                   primitive=None,
-                                   avals_in=[aval], avals_out=None,
-                                   tokens_in=ctx.tokens_in,
-                                   tokens_out=ctx.tokens_out),
+          ctx.replace(primitive=None,
+                      avals_in=[aval], avals_out=None),
           in_node)[0]
     for v, aval, in_node, arg_in_axes
     in zip(call_jaxpr.invars, ctx.avals_in, in_nodes, mesh_in_axes))
@@ -1364,8 +1389,8 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
   sub_ctx = ctx.module_context.replace(
       name_stack=xla.extend_name_stack(ctx.module_context.name_stack,
                                        wrap_name(name, 'xmap')))
-  if vectorized_jaxpr.effects:
-    raise NotImplementedError('Cannot lower effectful `xmap`')
+  if any(eff in core.ordered_effects for eff in vectorized_jaxpr.effects):
+    raise NotImplementedError('Cannot lower `xmap` with ordered effects.')
   tiled_outs, _ = mlir.jaxpr_subcomp(sub_ctx, vectorized_jaxpr, mlir.TokenSet(), (), *tiled_ins)
 
   outs = [
@@ -1373,12 +1398,9 @@ def _xmap_lowering_rule_replica(ctx, *in_nodes,
           partial(_untile, out_axes=ans_out_axes, axis_sizes=local_mesh_shape,
                   platform=ctx.module_context.platform),
           multiple_results=False)(
-              mlir.LoweringRuleContext(module_context=ctx.module_context,
-                                       primitive=None,
-                                       avals_in=[vectorized_outvar.aval],
-                                       avals_out=None,
-                                       tokens_in=ctx.tokens_in,
-                                       tokens_out=ctx.tokens_out), tiled_out)[0]
+              ctx.replace(primitive=None,
+                          avals_in=[vectorized_outvar.aval],
+                          avals_out=None), tiled_out)[0]
       for v, vectorized_outvar, tiled_out, ans_out_axes
       in zip(call_jaxpr.outvars, vectorized_jaxpr.outvars, tiled_outs,
              mesh_out_axes)]
@@ -1432,8 +1454,8 @@ def _xmap_lowering_rule_spmd(ctx, *global_in_nodes,
   sub_ctx = ctx.module_context.replace(
       name_stack=xla.extend_name_stack(ctx.module_context.name_stack,
                                        wrap_name(name, 'xmap')))
-  if vectorized_jaxpr.effects:
-    raise NotImplementedError('Cannot lower effectful `xmap`')
+  if any(eff in core.ordered_effects for eff in vectorized_jaxpr.effects):
+    raise NotImplementedError('Cannot lower `xmap` with ordered effects.')
   global_out_nodes, _ = mlir.jaxpr_subcomp(sub_ctx, vectorized_jaxpr,
       mlir.TokenSet(), (), *sharded_global_in_nodes)
 
@@ -1483,8 +1505,8 @@ def _xmap_lowering_rule_spmd_manual(ctx, *global_in_nodes,
       name_stack=xla.extend_name_stack(ctx.module_context.name_stack,
                                        wrap_name(name, 'xmap')),
       axis_context=ctx.module_context.axis_context.extend_manual(manual_mesh_axes))
-  if vectorized_jaxpr.effects:
-    raise NotImplementedError('Cannot lower effectful `xmap`')
+  if any(eff in core.ordered_effects for eff in vectorized_jaxpr.effects):
+    raise NotImplementedError('Cannot lower `xmap` with ordered effects.')
   global_out_nodes, _ = mlir.jaxpr_subcomp(sub_ctx, vectorized_jaxpr,
       mlir.TokenSet(), (), *([n] for n in global_in_nodes))
 
@@ -1788,27 +1810,30 @@ def _check_out_avals_vs_out_axes(out_avals: Sequence[core.AbstractValue],
                       f"defined by this xmap call: {', '.join(undeclared_axes_str)}")
 
 
-def _check_gda_xmap_partitioning(axis_resources, resource_env,
-                                 global_axis_sizes, in_axes_flat,
-                                 in_positional_semantics, args_flat):
+def _check_gda_or_array_xmap_partitioning(axis_resources, resource_env,
+                                          global_axis_sizes, in_axes_flat,
+                                          in_positional_semantics, args_flat):
   mesh_in_axes = EvaluationPlan.from_axis_resources(
       axis_resources, resource_env, global_axis_sizes,
       in_positional_semantics).to_mesh_axes(in_axes_flat)
   for arg, xmap_array_mapping in safe_zip(args_flat, mesh_in_axes):
-    if isinstance(arg, GlobalDeviceArray):
-      if arg.mesh != resource_env.physical_mesh:
-        raise ValueError("xmap's mesh and GDA's mesh should be equal. Got Xmap "
-                         f"mesh: {resource_env.physical_mesh},\n"
-                         f"GDA mesh: {arg.mesh}")
+    if isinstance(arg, (GlobalDeviceArray, Array)):
+      arr_flavor = 'GDA' if isinstance(arg, GlobalDeviceArray) else 'Array'
+      mesh = arg.mesh if arr_flavor == 'GDA' else arg.sharding.mesh
+      if mesh != resource_env.physical_mesh:
+        raise ValueError(f"xmap's mesh and {arr_flavor}'s mesh should be equal. "
+                         f"Got xmap mesh: {resource_env.physical_mesh},\n"
+                         f"{arr_flavor} mesh: {mesh}")
 
-      gda_array_mapping = _get_array_mapping(arg.mesh_axes)
-      if gda_array_mapping != xmap_array_mapping:
+      array_mapping = pxla._get_array_mapping(
+          arg.mesh_axes if arr_flavor == 'GDA' else arg.sharding.spec)
+      if array_mapping != xmap_array_mapping:
         raise ValueError(
-            "Got an input GDA to xmap with different partitioning than "
+            f"Got an input {arr_flavor} to xmap with different partitioning than "
             "specified in xmap. The partitioning must match. "
-            f"Got GDA spec: {pxla.array_mapping_to_axis_resources(gda_array_mapping)} and "
+            f"Got {arr_flavor} spec: {pxla.array_mapping_to_axis_resources(array_mapping)} and "
             f"xmap spec: {pxla.array_mapping_to_axis_resources(xmap_array_mapping)} "
-            f"for GDA: {arg}")
+            f"for {arr_flavor}: {arg}")
 
 
 # TODO: We should relax this at least for "constructor primitives"
@@ -1829,7 +1854,10 @@ def _check_no_loop_collectives(jaxpr, loop_axis_resources):
 
 
 def _fix_inferred_spmd_sharding(jaxpr, resource_env, gen_fresh_name = None):
-  from jax.experimental.pjit import sharding_constraint_p, ParsedPartitionSpec
+  from jax.experimental.pjit import (
+      sharding_constraint_p, ParsedPartitionSpec, get_unconstrained_dims,
+      OpShardingSharding)
+
   rec = lambda jaxpr: _fix_inferred_spmd_sharding(jaxpr, resource_env, gen_fresh_name)
   if isinstance(jaxpr, core.ClosedJaxpr):
     return jaxpr.map_jaxpr(rec)
@@ -1843,10 +1871,18 @@ def _fix_inferred_spmd_sharding(jaxpr, resource_env, gen_fresh_name = None):
     new_eqns.append(eqn.replace(
       outvars=tmp_outvars, params=dict(eqn.params, **new_jaxpr_params)))
     for outvar, tmpvar in zip(eqn.outvars, tmp_outvars):
-      new_eqns.append(core.JaxprEqn([tmpvar], [outvar], sharding_constraint_p,
-                      dict(resource_env=resource_env, axis_resources=ParsedPartitionSpec((), ())),
-                      set(),
-                      eqn.source_info))
+      mps = MeshPspecSharding._from_parsed_pspec(
+          resource_env.physical_mesh, ParsedPartitionSpec((), ()))
+      unconstrained_dims = get_unconstrained_dims(mps)
+      op_sharding_sharding = OpShardingSharding.get_replicated(
+          mps._device_assignment)
+      new_eqns.append(core.JaxprEqn(
+          [tmpvar], [outvar], sharding_constraint_p,
+          dict(resource_env=resource_env,
+               sharding=op_sharding_sharding,
+               unconstrained_dims=unconstrained_dims),
+          set(),
+          eqn.source_info))
   return jaxpr.replace(eqns=new_eqns)
 
 def _flatten_axes(what, tree, axes, tupled_args):
@@ -1900,12 +1936,6 @@ def _ensure_spmd_and(f):
     return f(v)
   return update
 
-def _ensure_supports_manual_and(f):
-  def update(v):
-    if v and not hasattr(xc.OpSharding.Type, "MANUAL"):
-      raise RuntimeError("This flag requires a version of jaxlib that supports MANUAL sharding type")
-    return f(v)
-  return update
 
 try:
   config.define_bool_state(
@@ -1923,7 +1953,7 @@ try:
             "the MANUAL partitioning feature of the XLA SPMD partitioner instead of "
             "sharding constraints on vectorized code. "
             "Requires experimental_xmap_spmd_lowering!"),
-      update_global_hook=_ensure_supports_manual_and(_ensure_spmd_and(_clear_compilation_cache)),
+      update_global_hook=_ensure_spmd_and(_clear_compilation_cache),
       update_thread_local_hook=_thread_local_flag_unsupported)
   config.define_bool_state(
       name="experimental_xmap_ensure_fixed_sharding",

@@ -21,12 +21,14 @@ import operator
 import types
 import threading
 from typing import (Any, Callable, Dict, Iterable, List, Tuple, Generic,
-                    TypeVar, Set, Iterator, Sequence)
+                    TypeVar, Set, Iterator, Sequence, Optional)
 import weakref
 
 from absl import logging
 import numpy as np
 
+from jax._src.lib import xla_client as xc
+from jax._src.lib import xla_extension_version
 from jax.config import config
 
 Seq = Sequence
@@ -167,9 +169,10 @@ def toposort(end_nodes):
         childless_nodes.append(parent)
       else:
         child_counts[id(parent)] -= 1
+  sorted_nodes = sorted_nodes[::-1]
 
-  check_toposort(sorted_nodes[::-1])
-  return sorted_nodes[::-1]
+  check_toposort(sorted_nodes)
+  return sorted_nodes
 
 def check_toposort(nodes):
   visited = set()
@@ -235,6 +238,8 @@ def weakref_lru_cache(call: Callable, maxsize=2048):
   and strong refs to all subsequent operations. In all other respects it should
   behave similar to `functools.lru_cache`.
   """
+  if xla_extension_version >= 87:
+    return xc.weakref_lru_cache(config._trace_context, call, maxsize)
   cache: Dict[Any, Any] = {}
   hits = misses = 0
   lock = threading.Lock()
@@ -440,18 +445,6 @@ def tuple_delete(t, idx):
   assert 0 <= idx < len(t), (idx, len(t))
   return t[:idx] + t[idx + 1:]
 
-# TODO(mattjj): replace with dataclass when Python 2 support is removed
-def taggedtuple(name, fields) -> Callable[..., Any]:
-  """Lightweight version of namedtuple where equality depends on the type."""
-  def __new__(cls, *xs):
-    return tuple.__new__(cls, (cls,) + xs)
-  def __repr__(self):
-    return f'{name}{tuple.__str__(self[1:])}'
-  class_namespace = {'__new__' : __new__, '__repr__': __repr__}
-  for i, f in enumerate(fields):
-    class_namespace[f] = property(operator.itemgetter(i+1))  # type: ignore
-  return type(name, (tuple,), class_namespace)
-
 class HashableFunction:
   """Decouples function equality and hash from its identity.
 
@@ -545,3 +538,18 @@ class OrderedSet(Generic[T]):
 
   def __contains__(self, elt: T) -> bool:
     return elt in self.elts_set
+
+
+class HashableWrapper:
+  x: Any
+  hash: Optional[int]
+  def __init__(self, x):
+    self.x = x
+    try: self.hash = hash(x)
+    except: self.hash = None
+  def __hash__(self):
+    return self.hash if self.hash is not None else id(self.x)
+  def __eq__(self, other):
+    if not isinstance(other, HashableWrapper):
+      return False
+    return self.x == other.x if self.hash is not None else self.x is other.x

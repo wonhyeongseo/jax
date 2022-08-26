@@ -20,12 +20,13 @@ import warnings
 
 import numpy as np
 
+import jax
 from jax import core
 from jax import lax
 from jax._src import api
 from jax._src import dtypes
 from jax._src.numpy.ndarray import ndarray
-from jax._src.numpy.util import _broadcast_to, _check_arraylike, _complex_elem_type, _where, _wraps
+from jax._src.numpy.util import _broadcast_to, _check_arraylike, _complex_elem_type, _promote_dtypes_inexact, _where, _wraps
 from jax._src.lax import lax as lax_internal
 from jax._src.util import canonicalize_axis as _canonicalize_axis, maybe_named_axis
 
@@ -53,6 +54,10 @@ def _moveaxis(a, source: int, destination: int):
   perm.insert(destination, source)
   return lax.transpose(a, perm)
 
+def _upcast_f16(dtype):
+  if dtype in [np.float16, dtypes.bfloat16]:
+    return np.dtype('float32')
+  return dtype
 
 def _reduction(a, name, np_fun, op, init_val, has_identity=True,
                preproc=None, bool_op=None, upcast_f16_for_computation=False,
@@ -68,19 +73,22 @@ def _reduction(a, name, np_fun, op, init_val, has_identity=True,
   lax_internal._check_user_dtype_supported(dtype, name)
   axis = core.concrete_or_error(None, axis, f"axis argument to jnp.{name}().")
 
-  if initial is None and not has_identity:
-    if not _all(core.greater_equal_dim(d, 1) for d in np.shape(a)):
-      raise ValueError(f"zero-size array to reduction operation {name} which has no identity")
-    if where_ is not None:
-      raise ValueError(f"reduction operation {name} does not have an identity, so to use a "
-                       f"where mask one has to specify 'initial'")
+  if initial is None and not has_identity and where_ is not None:
+    raise ValueError(f"reduction operation {name} does not have an identity, so to use a "
+                     f"where mask one has to specify 'initial'")
 
   a = a if isinstance(a, ndarray) else _asarray(a)
   a = preproc(a) if preproc else a
   pos_dims, dims = _reduction_dims(a, axis)
+
+  if initial is None and not has_identity:
+    shape = np.shape(a)
+    if not _all(core.greater_equal_dim(shape[d], 1) for d in pos_dims):
+      raise ValueError(f"zero-size array to reduction operation {name} which has no identity")
+
   result_dtype = dtypes.canonicalize_dtype(dtype or dtypes.dtype(np_fun(np.ones((), dtype=dtypes.dtype(a)))))
   if upcast_f16_for_computation and dtypes.issubdtype(result_dtype, np.inexact):
-    computation_dtype = dtypes.promote_types(result_dtype, np.float32)
+    computation_dtype = _upcast_f16(result_dtype)
   else:
     computation_dtype = result_dtype
   a = lax.convert_element_type(a, computation_dtype)
@@ -269,10 +277,7 @@ def _mean(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, dtype=None,
     normalizer = sum(_broadcast_to(where, np.shape(a)), axis, dtype=dtype, keepdims=keepdims)
 
   if dtype is None:
-    if dtypes.issubdtype(dtypes.dtype(a), np.bool_) or dtypes.issubdtype(dtypes.dtype(a), np.integer):
-      dtype = dtypes.float_
-    else:
-      dtype = dtypes.dtype(a)
+    dtype = dtypes.to_inexact_dtype(dtypes.dtype(a))
   dtype = dtypes.canonicalize_dtype(dtype)
 
   return lax.div(
@@ -281,28 +286,23 @@ def _mean(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, dtype=None,
 
 @_wraps(np.average)
 def average(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, weights=None,
-            returned=False):
-  return _average(a, _ensure_optional_axes(axis), weights, returned)
+            returned=False, keepdims=False):
+  return _average(a, _ensure_optional_axes(axis), weights, returned, keepdims)
 
-@partial(api.jit, static_argnames=('axis', 'returned'), inline=True)
+@partial(api.jit, static_argnames=('axis', 'returned', 'keepdims'), inline=True)
 def _average(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, weights=None,
-            returned=False):
-  a = _asarray(a)
-
+             returned=False, keepdims=False):
   if weights is None: # Treat all weights as 1
-    avg = mean(a, axis=axis)
+    _check_arraylike("average", a)
+    a, = _promote_dtypes_inexact(a)
+    avg = mean(a, axis=axis, keepdims=keepdims)
     if axis is None:
-      weights_sum = lax.full((), core.dimension_as_value(np.size(a)), dtype=avg.dtype)
+      weights_sum = lax.full((), core.dimension_as_value(a.size), dtype=avg.dtype)
     else:
       weights_sum = lax.full_like(avg, core.dimension_as_value(a.shape[axis]), dtype=avg.dtype)
   else:
-    weights = _asarray(weights)
-
-    if dtypes.issubdtype(a.dtype, np.inexact):
-      out_dtype = dtypes.result_type(a.dtype, weights.dtype)
-    else:
-      out_dtype = dtypes.result_type(a.dtype, weights.dtype, dtypes.float_)
-    out_dtype = dtypes.canonicalize_dtype(out_dtype)
+    _check_arraylike("average", a, weights)
+    a, weights = _promote_dtypes_inexact(a, weights)
 
     a_shape = np.shape(a)
     a_ndim = len(a_shape)
@@ -324,8 +324,8 @@ def _average(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, weights=None
       weights = _broadcast_to(weights, (a_ndim - 1) * (1,) + weights_shape)
       weights = _moveaxis(weights, -1, axis)
 
-    weights_sum = sum(weights, axis=axis, dtype=out_dtype)
-    avg = sum(a * weights, axis=axis, dtype=out_dtype) / weights_sum
+    weights_sum = sum(weights, axis=axis, keepdims=keepdims)
+    avg = sum(a * weights, axis=axis, keepdims=keepdims) / weights_sum
 
   if returned:
     if avg.shape != weights_sum.shape:
@@ -348,9 +348,10 @@ def _var(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, dtype=None,
   if out is not None:
     raise NotImplementedError("The 'out' argument to jnp.var is not supported.")
 
-  a_dtype, dtype = _var_promote_types(dtypes.dtype(a), dtype)
-  a_mean = mean(a, axis, dtype=a_dtype, keepdims=True, where=where)
-  centered = a - a_mean
+  computation_dtype, dtype = _var_promote_types(dtypes.dtype(a), dtype)
+  a = a.astype(computation_dtype)
+  a_mean = mean(a, axis, dtype=computation_dtype, keepdims=True, where=where)
+  centered = lax.sub(a, a_mean)
   if dtypes.issubdtype(centered.dtype, np.complexfloating):
     centered = lax.real(lax.mul(centered, lax.conj(centered)))
   else:
@@ -380,14 +381,15 @@ def _var_promote_types(a_dtype, dtype):
              "on https://github.com/google/jax/issues/2283 if this behavior is "
              "important to you.")
       raise ValueError(msg)
-    a_dtype = dtypes.promote_types(a_dtype, dtype)
+    computation_dtype = dtype
   else:
     if not dtypes.issubdtype(a_dtype, np.inexact):
-      dtype = a_dtype = dtypes.canonicalize_dtype(dtypes.float_)
+      dtype = dtypes.to_inexact_dtype(a_dtype)
+      computation_dtype = dtype
     else:
       dtype = _complex_elem_type(a_dtype)
-      a_dtype = dtypes.promote_types(a_dtype, np.float32)
-  return a_dtype, dtype
+      computation_dtype = a_dtype
+  return _upcast_f16(computation_dtype), dtype
 
 
 @_wraps(np.std, skip_params=['out'])
@@ -511,10 +513,11 @@ def nanvar(a, axis: Optional[Union[int, Tuple[int, ...]]] = None, dtype=None,
   if out is not None:
     raise NotImplementedError("The 'out' argument to jnp.nanvar is not supported.")
 
-  a_dtype, dtype = _var_promote_types(dtypes.dtype(a), dtype)
-  a_mean = nanmean(a, axis, dtype=a_dtype, keepdims=True, where=where)
+  computation_dtype, dtype = _var_promote_types(dtypes.dtype(a), dtype)
+  a = a.astype(computation_dtype)
+  a_mean = nanmean(a, axis, dtype=computation_dtype, keepdims=True, where=where)
 
-  centered = _where(lax_internal._isnan(a), 0, a - a_mean)  # double-where trick for gradients.
+  centered = _where(lax_internal._isnan(a), 0, lax.sub(a, a_mean))  # double-where trick for gradients.
   if dtypes.issubdtype(centered.dtype, np.complexfloating):
     centered = lax.real(lax.mul(centered, lax.conj(centered)))
   else:

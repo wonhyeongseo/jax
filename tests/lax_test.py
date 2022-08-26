@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from __future__ import annotations
 
 import collections
 from functools import partial
 import itertools
 import operator
+import types
 import unittest
 from unittest import SkipTest
+from typing import Tuple
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -33,12 +35,17 @@ from jax.test_util import check_grads
 from jax import tree_util
 import jax.util
 
+from jax.interpreters import xla
+from jax.interpreters import mlir
+from jax.interpreters import batching
+from jax.experimental import array
+from jax._src.lib.mlir.dialects import mhlo
+from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax._src import lax_reference
 from jax._src.util import prod
 from jax._src.lax import lax as lax_internal
-
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -72,7 +79,10 @@ preferred_type_combinations = [
   (np.float64, np.float64), (np.int8, np.int8), (np.int8, np.int16), (np.int8, np.int32),
   (np.int8, np.int64), (np.int16, np.int16), (np.int16, np.int32), (np.int16, np.int64),
   (np.int32, np.int32), (np.int32, np.int64), (np.int64, np.int64),
-  (np.complex64, np.complex64), (np.complex64, np.complex128), (np.complex128, np.complex128)]
+  (np.complex64, np.complex64), (np.complex64, np.complex128), (np.complex128, np.complex128),
+  (np.int8, np.float16), (np.int8, dtypes.bfloat16), (np.int8, np.float32), (np.int8, np.float64),
+  (np.int16, np.float16), (np.int16, dtypes.bfloat16), (np.int16, np.float32), (np.int16, np.float64),
+  (np.int32, np.float32), (np.int32, np.float64), (np.int64, np.float64)]
 
 
 OpRecord = collections.namedtuple(
@@ -178,6 +188,27 @@ LAX_OPS = [
     op_record("gt", 2, default_dtypes, jtu.rand_small),
     op_record("le", 2, default_dtypes, jtu.rand_small),
     op_record("lt", 2, default_dtypes, jtu.rand_small),
+]
+
+ReducerOpRecord = collections.namedtuple(
+  "ReducerOpRecord", ["op", "reference_op", "init_val", "dtypes", "primitive"]
+)
+
+LAX_REDUCE_OPS = [
+  ReducerOpRecord(lax.add, np.add, 0, default_dtypes, lax.reduce_sum_p),
+  ReducerOpRecord(lax.mul, np.multiply, 1, default_dtypes, lax.reduce_prod_p),
+  ReducerOpRecord(lax.max, np.maximum, 0, uint_dtypes + bool_dtypes, lax.reduce_max_p),
+  ReducerOpRecord(lax.max, np.maximum, -np.inf, float_dtypes, lax.reduce_max_p),
+  ReducerOpRecord(lax.max, np.maximum, dtypes.iinfo(np.int32).min, [np.int32], lax.reduce_max_p),
+  ReducerOpRecord(lax.max, np.maximum, dtypes.iinfo(np.int64).min, [np.int64], lax.reduce_max_p),
+  ReducerOpRecord(lax.min, np.minimum, np.inf, float_dtypes, lax.reduce_min_p),
+  ReducerOpRecord(lax.min, np.minimum, dtypes.iinfo(np.int32).max, [np.int32], lax.reduce_min_p),
+  ReducerOpRecord(lax.min, np.minimum, dtypes.iinfo(np.int64).max, [np.int64], lax.reduce_min_p),
+  ReducerOpRecord(lax.min, np.minimum, dtypes.iinfo(np.uint32).max, [np.uint32], lax.reduce_min_p),
+  ReducerOpRecord(lax.min, np.minimum, dtypes.iinfo(np.uint64).max, [np.uint64], lax.reduce_min_p),
+  ReducerOpRecord(lax.bitwise_and, np.bitwise_and, -1, int_dtypes + uint_dtypes + bool_dtypes, lax.reduce_and_p),
+  ReducerOpRecord(lax.bitwise_or, np.bitwise_or, 0, int_dtypes + uint_dtypes + bool_dtypes, lax.reduce_or_p),
+  ReducerOpRecord(lax.bitwise_xor, np.bitwise_xor, 0, int_dtypes + uint_dtypes + bool_dtypes, lax.reduce_xor_p),
 ]
 
 
@@ -1357,6 +1388,30 @@ class LaxTest(jtu.JaxTestCase):
     check_grads(op, args_maker(), 2, ["fwd", "rev"], eps=1.)
 
   @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": f"_input_type={input_type}_jit={jit}",
+       "input_type": input_type, "jit": jit}
+      for input_type in ["np.array", "jnp.array", "float", "np.float32"]
+      for jit in [True, False]))
+  def testEmptySqueezeReturnType(self, input_type, jit):
+    if input_type == "np.array":
+      operand = np.arange(5)
+    elif input_type == "jnp.array":
+      operand = jnp.arange(5)
+    elif input_type == "float":
+      operand = 2.0
+    elif input_type == "np.float32":
+      operand = np.float32(2.0)
+    else:
+      raise ValueError(f"Unrecognized input_type={input_type}")
+
+    op = lambda x: lax.squeeze(x, dimensions=())
+    if jit:
+      op = jax.jit(op)
+    result = op(operand)
+    expected_type = array.Array if config.jax_array else jnp.DeviceArray
+    self.assertIsInstance(result, expected_type)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_inshape={}_outshape={}".format(
           jtu.format_shape_dtype_string(arg_shape, dtype),
           jtu.format_shape_dtype_string(out_shape, dtype)),
@@ -1609,6 +1664,11 @@ class LaxTest(jtu.JaxTestCase):
     np.testing.assert_equal(lax.dynamic_slice(x, [2, 3], jnp.array([2, 2])),
                             x[2:4, 3:5])
 
+  def testDynamicSliceWithNonScalarIndex(self):
+    x = jnp.ones((6, 7), np.int32)
+    with self.assertRaises(TypeError):
+      lax.dynamic_slice_in_dim(x, jnp.array([2, 2]), 3)
+
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_shape={}_indices={}_update_shape={}".format(
           jtu.format_shape_dtype_string(shape, dtype),
@@ -1660,6 +1720,12 @@ class LaxTest(jtu.JaxTestCase):
     actual = jax.vmap(lax.dynamic_update_slice, (None, None, 0))(x, y, (ind,))
     self.assertAllClose(expected, actual)
 
+  def testDynamicUpdateSliceWithNonScalarIndex(self):
+    x = jnp.ones((6, 7), np.int32)
+    with self.assertRaises(TypeError):
+      lax.dynamic_update_slice_in_dim(x, jnp.ones((2, 7), np.int32),
+                                      jnp.array([2, 2]), axis=0)
+
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_shape={}_perm={}".format(
           jtu.format_shape_dtype_string(shape, dtype), perm),
@@ -1701,28 +1767,28 @@ class LaxTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_op={}_inshape={}_reducedims={}_initval={}"
-       .format(op.__name__, jtu.format_shape_dtype_string(shape, dtype), dims,
-               init_val),
-       "op": op, "init_val": init_val, "shape": shape, "dtype": dtype, "dims": dims}
-      for init_val, op, types in [
-          (0, lax.add, default_dtypes),
-          (1, lax.mul, default_dtypes),
-          (0, lax.max, all_dtypes), # non-monoidal
-          (-np.inf, lax.max, float_dtypes),
-          (dtypes.iinfo(np.int32).min, lax.max, [np.int32]),
-          (dtypes.iinfo(np.int64).min, lax.max, [np.int64]),
-          (np.inf, lax.min, float_dtypes),
-          (dtypes.iinfo(np.int32).max, lax.min, [np.int32]),
-          (dtypes.iinfo(np.int64).max, lax.min, [np.int64]),
-          (dtypes.iinfo(np.uint32).max, lax.min, [np.uint32]),
-          (dtypes.iinfo(np.uint64).max, lax.min, [np.uint64]),
-      ]
-      for dtype in types
+       .format(rec.op.__name__, jtu.format_shape_dtype_string(shape, dtype), dims,
+               rec.init_val),
+       "op": rec.op, "reference_op": rec.reference_op, "init_val": rec.init_val,
+       "shape": shape, "dtype": dtype, "dims": dims, "primitive": rec.primitive}
+      for rec in LAX_REDUCE_OPS
+      for dtype in rec.dtypes
       for shape, dims in [
           [(3, 4, 5), (0,)], [(3, 4, 5), (1, 2)],
           [(3, 4, 5), (0, 2)], [(3, 4, 5), (0, 1, 2)]
       ]))
-  def testReduce(self, op, init_val, shape, dtype, dims):
+  def testReduce(self, op, reference_op, init_val, shape, dtype, dims, primitive):
+    if not config.x64_enabled and dtype in (np.float64, np.int64, np.uint64):
+      raise SkipTest("x64 mode is disabled.")
+    def reference_fun(operand):
+      if hasattr(reference_op, "reduce"):
+        initial = np.array(init_val, dtype=dtype)
+        result = reference_op.reduce(operand, axis=dims, initial=initial)
+      else:
+        result = reference_op(operand, axis=dims)
+
+      return result.astype(dtype)
+
     rng_factory = (jtu.rand_default if dtypes.issubdtype(dtype, np.integer)
                    else jtu.rand_small)
     rng = rng_factory(self.rng())
@@ -1736,6 +1802,12 @@ class LaxTest(jtu.JaxTestCase):
     fun = lambda operand: lax.reduce(operand, init_val, op, dims)
     args_maker = lambda: [rng(shape, dtype)]
     self._CompileAndCheck(fun, args_maker)
+    self._CheckAgainstNumpy(reference_fun, fun, args_maker)
+
+    # check that the correct monoid reducer primitive is used inside the jaxpr.
+    # This requires the init_val (monoid identity element) to be static
+    jaxpr = jax.make_jaxpr(fun)(rng(shape, dtype))
+    self.assertEqual(jaxpr.eqns[0].primitive, primitive)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_op={}.{}_arr_weak_type={}_init_weak_type={}"
@@ -1755,6 +1827,26 @@ class LaxTest(jtu.JaxTestCase):
     self.assertEqual(dtypes.is_weakly_typed(out), arr_weak_type and init_weak_type)
     out_jit = jax.jit(fun)(arr, init)
     self.assertEqual(dtypes.is_weakly_typed(out_jit), arr_weak_type and init_weak_type)
+
+  def testReduceWindowScalar(self):
+    rng = jtu.rand_small(self.rng())
+    dtype = jnp.float32
+    init_val = np.asarray(0, dtype=dtype)
+    op = lax.add
+
+    def fun(operand, init_val):
+      return lax.reduce_window(
+          operand, init_val, op, window_dimensions=(), window_strides=(),
+          padding=(), base_dilation=(), window_dilation=())
+
+    def reference_fun(operand, init_val):
+      return lax_reference.reduce_window(
+          operand, init_val, op, window_dimensions=(), window_strides=(),
+          padding=(), base_dilation=())
+
+    args_maker = lambda: [rng((), dtype), init_val]
+    self._CompileAndCheck(fun, args_maker)
+    self._CheckAgainstNumpy(reference_fun, fun, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": ("_op={}_shape={}_dims={}_strides={}_padding={}"
@@ -2513,6 +2605,11 @@ class LaxTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(ValueError, "duplicate value in 'axes' .*"):
       lax.reduce(np.arange(3), 0, lax.add, (0, 0))
 
+  @parameterized.parameters([lax.rem, lax.lt, lax.gt, lax.ge, lax.le])
+  def test_ops_do_not_accept_complex_dtypes(self, op):
+    with self.assertRaisesRegex(TypeError, ".*does not accept dtype complex.*"):
+      op(2+3j, 4+5j)
+
   def test_population_count_booleans_not_supported(self):
     # https://github.com/google/jax/issues/3886
     msg = "population_count does not accept dtype bool"
@@ -2571,7 +2668,7 @@ class LaxTest(jtu.JaxTestCase):
     result = lax.reduce(operands, init_values,
                         lambda x, y: tree_util.tree_map(lax.add, x, y),
                         [0])
-    self.assertDictEqual(result, {'x': [5., 10.]})
+    self.assertDictEqual(result, {'x': [5., 10]})
 
   def test_reduce_with_mismatched_pytrees_errors(self):
     operands = {'x': np.ones(5)}
@@ -2775,7 +2872,10 @@ class LazyConstantTest(jtu.JaxTestCase):
     if jit:
       op = jax.jit(op)
     result = op(input_type(value))
-    assert isinstance(result, jnp.DeviceArray)
+    if config.jax_array:
+      assert isinstance(result, array.Array)
+    else:
+      assert isinstance(result, jnp.DeviceArray)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_dtype_in={}_dtype_out={}".format(
@@ -2788,10 +2888,16 @@ class LazyConstantTest(jtu.JaxTestCase):
     self.assertEqual(x.dtype, dtype_in)
     y = lax.convert_element_type(x, dtype_out)
     self.assertEqual(y.dtype, dtype_out)
-    if np.dtype(dtype_in) == np.dtype(dtype_out):
-      self.assertIs(x.device_buffer, y.device_buffer)
+    if config.jax_array:
+      x_buf = x._arrays[0]
+      y_buf = y._arrays[0]
     else:
-      self.assertFalse(x.device_buffer is y.device_buffer)
+      x_buf = x.device_buffer
+      y_buf = y.device_buffer
+    if np.dtype(dtype_in) == np.dtype(dtype_out):
+      self.assertIs(x_buf, y_buf)
+    else:
+      self.assertIsNot(x_buf, y_buf)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_fn={}_indexdtype={}"
@@ -2847,9 +2953,9 @@ class LazyConstantTest(jtu.JaxTestCase):
       unary_op_types[r.op] = (unary_op_types.get(r.op, set()) |
                               {np.dtype(t) for t in r.dtypes})
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-        {"testcase_name": f"_{op}", "op_name": op, "rec_dtypes": dtypes}
-      for op, dtypes in unary_op_types.items()))
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op}", "op_name": op, "rec_dtypes": dtypes}
+      for op, dtypes in unary_op_types.items())
   def testUnaryWeakTypes(self, op_name, rec_dtypes):
     """Test that all lax unary ops propagate weak_type information appropriately."""
     # Find a valid dtype for the function.
@@ -2867,8 +2973,12 @@ class LazyConstantTest(jtu.JaxTestCase):
     lax_op = op(lax_val)
 
     self.assertAllClose(py_op, lax_op, check_dtypes=True)
-    self.assertTrue(py_op.aval.weak_type)
     self.assertFalse(lax_op.aval.weak_type)
+    if type(py_val) == bool:
+      # Booleans should have weak types stripped.
+      self.assertFalse(py_op.aval.weak_type)
+    else:
+      self.assertTrue(py_op.aval.weak_type)
 
   def testCumsumLengthOne(self):
     # regression test for issue 4672
@@ -2877,10 +2987,11 @@ class LazyConstantTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, x)
 
   def testLog1pNearOne(self):
+    expected = np.log1p(np.float32(1e-5))
     np.testing.assert_array_almost_equal_nulp(
-        np.log1p(np.float32(1e-5)), lax.log1p(np.float32(1e-5)))
+        expected.astype(np.float32), lax.log1p(np.float32(1e-5)))
     np.testing.assert_array_almost_equal_nulp(
-        np.log1p(np.float32(1e-5)), lax.log1p(np.complex64(1e-5)))
+        expected.astype(np.complex64), lax.log1p(np.complex64(1e-5)))
 
 
 class LaxNamedShapeTest(jtu.JaxTestCase):
@@ -2902,6 +3013,358 @@ class LaxNamedShapeTest(jtu.JaxTestCase):
       expected = core.ShapedArray((2, 3), np.float32, False, {'j': 5})
       (out,), _ = lax.psum_p.abstract_eval(aval1, axes=('i',), axis_index_groups=None)
       self.assertEqual(out, expected)
+
+
+class FooTy:
+  name = 'foo'
+  def __hash__(self) -> int:
+    return hash(FooTy)
+  def __eq__(self, other) -> bool:
+    return type(other) is FooTy
+  def __repr__(self) -> str:
+    return self.name
+  __str__ = __repr__
+
+  # handlers
+
+  @staticmethod
+  def aval_to_ir_types(aval):
+    aval2 = core.ShapedArray((*aval.shape, 2), jnp.dtype('uint32'))
+    return mlir.aval_to_ir_types(aval2)
+
+  @staticmethod
+  def result_handler(sticky_device, aval):
+    def handler(_, buf):
+      buf.aval = core.ShapedArray(buf.shape, buf.dtype)
+      return FooArray(aval.shape, buf)
+    return handler
+
+  # eltype-polymorphic primitive lowering rules
+
+  @staticmethod
+  def empty_mlir(ctx):
+    return mlir.ir_constants(np.zeros((2,), dtype=np.dtype('uint32')))
+
+  @staticmethod
+  def slice_mlir(ctx, x, start_indices, limit_indices, strides):
+    start_indices = (*start_indices, 0)
+    limit_indices = (*limit_indices, 2)
+    strides = (*strides, 1)
+    return mhlo.SliceOp(x,
+                        mlir.dense_int_elements(start_indices),
+                        mlir.dense_int_elements(limit_indices),
+                        mlir.dense_int_elements(strides)).results
+
+  @staticmethod
+  def dynamic_slice_mlir(ctx, x, start_indices, slice_sizes):
+    dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
+    start_indices = (*start_indices, mlir.ir_constant(np.array(0, dtype=dtype)))
+    slice_sizes_ = mlir.dense_int_elements((*slice_sizes, 2))
+    return mhlo.DynamicSliceOp(x, start_indices, slice_sizes_).results
+
+  @staticmethod
+  def dynamic_update_slice_mlir(ctx, x, update, *start_indices):
+    aval_out, = ctx.avals_out
+    dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
+    start_indices = (*start_indices, mlir.ir_constant(np.array(0, dtype=dtype)))
+    return mhlo.DynamicUpdateSliceOp(mlir.aval_to_ir_type(aval_out), x, update,
+                                     start_indices).results
+
+  @staticmethod
+  def broadcast_in_dim_mlir(ctx, x, *dyn_shape, shape, broadcast_dimensions):
+    if dyn_shape: raise NotImplementedError
+    aval_out, = ctx.avals_out
+    broadcast_dimensions = [*broadcast_dimensions, aval_out.ndim]
+    return mhlo.BroadcastInDimOp(
+        mlir.aval_to_ir_type(aval_out), x,
+        mlir.dense_int_elements(broadcast_dimensions)).results
+
+  @staticmethod
+  def transpose_mlir(ctx, x, *, permutation):
+    perm = [*permutation, len(permutation)]
+    return mhlo.TransposeOp(x, mlir.dense_int_elements(perm)).results
+
+  @staticmethod
+  def gather_mlir(ctx, x, indices, *,
+                  dimension_numbers, slice_sizes, unique_indices,
+                  indices_are_sorted, mode, fill_value):
+    aval_x, aval_indices = ctx.avals_in
+    aval_y, = ctx.avals_out
+    dimension_numbers = dimension_numbers._replace(
+        offset_dims=(*dimension_numbers.offset_dims, aval_y.ndim))
+    slice_sizes = (*slice_sizes, 2)
+    gather_lower = partial(
+        lax_internal.slicing._gather_lower, dimension_numbers=dimension_numbers,
+        slice_sizes=slice_sizes, unique_indices=unique_indices,
+        indices_are_sorted=indices_are_sorted, mode=mode, fill_value=fill_value)
+    aval_x_raw = core.ShapedArray((*aval_x.shape, 2), np.dtype('uint32'))
+    aval_y_raw = core.ShapedArray((*aval_y.shape, 2), np.dtype('uint32'))
+    return mlir.delegate_lowering(ctx, gather_lower, x, indices,
+                                  avals_in=[aval_x_raw, aval_indices],
+                                  avals_out=[aval_y_raw])
+
+# primitives
+
+make_p = core.Primitive('make')
+bake_p = core.Primitive('bake')
+take_p = core.Primitive('take')
+
+def make(shape): return make_p.bind(shape=tuple(shape))
+def bake(k):     return bake_p.bind(k)
+def take(k):     return take_p.bind(k)
+
+@make_p.def_abstract_eval
+def make_abstract_eval(*, shape):
+  return core.ShapedArray(shape, FooTy())
+
+@bake_p.def_abstract_eval
+def bake_abstract_eval(x):
+  if type(x.dtype) != FooTy: raise TypeError
+  return core.ShapedArray(tuple(reversed(x.shape)), FooTy())
+
+@take_p.def_abstract_eval
+def take_abstract_eval(x):
+  return core.ShapedArray(x.shape, jnp.dtype('float32'))
+
+# runtime ('outside jit') data types
+
+class FooArray:
+  shape: Tuple[int, ...]
+  data: jnp.ndarray
+
+  def __init__(self, shape, data):
+    assert data.shape == (*shape, 2)
+    self.shape = shape
+    self.data = data
+
+  def __repr__(self) -> str:
+    shape = ','.join(map(str, self.shape))
+    return f'foo[{shape}] with value\n{self.data}'
+
+  size = property(lambda self: self.data.size // 2)
+  ndim = property(lambda self: self.data.ndim - 1)
+
+def device_put_foo_array(x: FooArray, device):
+  if isinstance(x.data, array.Array):
+    return array._device_put_array(x.data, device)
+  return dispatch._device_put_array(x.data, device)
+
+def foo_array_constant_handler(x, c):
+  if config.jax_array:
+    return array._array_mlir_constant_handler(x.data, c)
+  return mlir._device_array_constant_handler(x.data, c)
+
+def make_lowering(*, shape):
+  return jnp.zeros((*shape, 2), 'uint32')
+
+def bake_lowering(k):
+  return k.T
+
+def take_lowering(k):
+  return jnp.broadcast_to(jnp.float32(k.size), k.shape)
+
+
+def bake_vmap(batched_args, batch_dims):
+  xs, = batched_args
+  bdim_in, = batch_dims
+  ys = bake(xs)
+  perm = list(reversed(range(xs.ndim)))
+  bdim_out = perm[bdim_in]
+  return ys, bdim_out
+
+
+class CustomElementTypesTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    core.custom_eltypes.add(FooTy)
+    core.pytype_aval_mappings[FooArray] = \
+        lambda x: core.ShapedArray(x.shape, FooTy())
+    xla.canonicalize_dtype_handlers[FooArray] = lambda x: x
+    xla.pytype_aval_mappings[FooArray] = \
+        lambda x: core.ShapedArray(x.shape, FooTy())
+    dispatch.device_put_handlers[FooArray] = device_put_foo_array
+    mlir._constant_handlers[FooArray] = foo_array_constant_handler
+    mlir.register_lowering(make_p, mlir.lower_fun(make_lowering, False))
+    mlir.register_lowering(bake_p, mlir.lower_fun(bake_lowering, False))
+    mlir.register_lowering(take_p, mlir.lower_fun(take_lowering, False))
+    batching.defvectorized(take_p)
+    batching.primitive_batchers[bake_p] = bake_vmap
+
+  def tearDown(self):
+    core.custom_eltypes.remove(FooTy)
+    del core.pytype_aval_mappings[FooArray]
+    del xla.canonicalize_dtype_handlers[FooArray]
+    del xla.pytype_aval_mappings[FooArray]
+    del dispatch.device_put_handlers[FooArray]
+    del mlir._constant_handlers[FooArray]
+    del mlir._lowerings[make_p]
+    del mlir._lowerings[bake_p]
+    del mlir._lowerings[take_p]
+    del batching.primitive_batchers[take_p]
+    del batching.primitive_batchers[bake_p]
+
+  def test_shaped_array_construction(self):
+    aval = core.ShapedArray((), FooTy())
+    self.assertEqual(aval.str_short(), 'foo[]')
+    aval = core.ShapedArray((3, 4), FooTy())
+    self.assertEqual(aval.str_short(), 'foo[3,4]')
+
+  def test_make_jaxpr_identity(self):
+    x = types.SimpleNamespace(shape=(3,), dtype=FooTy())
+    jaxpr = jax.make_jaxpr(lambda x: x)(x).jaxpr
+    # { lambda ; a:foo[3]. let  in (a,) }
+    self.assertLen(jaxpr.invars, 1)
+    a, = jaxpr.invars
+    self.assertEqual(a.aval, core.ShapedArray((3,), FooTy()))
+    self.assertLen(jaxpr.outvars, 1)
+    a, = jaxpr.outvars
+    self.assertEqual(a.aval, core.ShapedArray((3,), FooTy()))
+
+  # tests after here need the primitives
+
+  def test_make_jaxpr_with_primitives(self):
+    def f():
+      k1 = make((3, 4))
+      k2 = bake(k1)
+      x  = take(k2)
+      return x
+
+    jaxpr = jax.make_jaxpr(f)().jaxpr
+    # { lambda ; . let
+    #     a:foo[3,4] = make[shape=(3, 4)]
+    #     b:foo[4,3] = bake a
+    #     c:f32[4,3] = take b
+    #   in (c,) }
+    self.assertLen(jaxpr.invars, 0)
+    self.assertLen(jaxpr.eqns, 3)
+    e1, e2, e3 = jaxpr.eqns
+
+    self.assertIs(e1.primitive, make_p)
+    self.assertLen(e1.outvars, 1)
+    a, = e1.outvars
+    self.assertEqual(a.aval, core.ShapedArray((3, 4), FooTy()))
+
+    self.assertIs(e2.primitive, bake_p)
+    self.assertLen(e2.outvars, 1)
+    b, = e2.outvars
+    self.assertEqual(b.aval, core.ShapedArray((4, 3), FooTy()))
+
+    self.assertIs(e3.primitive, take_p)
+    self.assertLen(e3.outvars, 1)
+    c, = e3.outvars
+    self.assertEqual(c.aval, core.ShapedArray((4, 3), np.dtype('float32')))
+
+  # tests after here need FooArray and lowerings
+
+  def test_jit_closure(self):
+    k = FooArray((), jnp.arange(2, dtype='uint32'))
+
+    @jax.jit
+    def f():
+      jnp.add(1, 1)  # make jit not hit trivial dispatch path
+      return k
+
+    y = f()  # doesn't crash
+    self.assertIsInstance(y, FooArray)
+    self.assertEqual(y.shape, ())
+
+  def test_jit_identity(self):
+    k = FooArray((), jnp.arange(2, dtype='uint32'))
+
+    @jax.jit
+    def f(k):
+      jnp.add(1, 1)  # make jit not hit trivial dispatch path
+      return k
+
+    y = f(k)  # doesn't crash
+    self.assertIsInstance(y, FooArray)
+    self.assertEqual(y.shape, ())
+
+  def test_jit_multiple_primitives(self):
+    @jax.jit
+    def f():
+      k1 = make((3,))
+      k2 = bake(k1)
+      y  = take(k2)
+      return y
+
+    y = f()
+    self.assertArraysAllClose(y, jnp.array([3., 3., 3.]), check_dtypes=False)
+
+  def test_scan_jaxpr(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    f = lambda ks: jax.lax.scan(lambda _, k: (None, bake(k)), None, ks)
+    jaxpr = jax.make_jaxpr(f)(ks).jaxpr
+    # { lambda ; a:foo[3,4]. let
+    #     b:foo[3,4] = scan[
+    #       jaxpr={ lambda ; c:foo[4]. let d:foo[4] = bake c in (d,) }
+    #     ] a
+    #   in (b,) }
+    self.assertLen(jaxpr.invars, 1)
+    a, = jaxpr.invars
+    self.assertEqual(a.aval, core.ShapedArray((3, 4), FooTy()))
+    self.assertLen(jaxpr.eqns, 1)
+    e, = jaxpr.eqns
+    self.assertLen(e.outvars, 1)
+    b, = e.outvars
+    self.assertEqual(b.aval, core.ShapedArray((3, 4), FooTy()))
+
+  def test_scan_lowering(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    f = lambda ks: jax.lax.scan(lambda _, k: (None, bake(k)), None, ks)
+    _, out = jax.jit(f)(ks)  # doesn't crash
+    self.assertIsInstance(out, FooArray)
+    self.assertEqual(out.shape, (3, 4))
+
+  def test_vmap(self):
+    ks = jax.jit(lambda: make((3, 4, 5)))()
+    ys = jax.vmap(jax.jit(lambda k: take(bake(k))))(ks)
+    expected = jnp.broadcast_to(3 * 4 * 5, (3, 5, 4)).astype('float32')
+    self.assertAllClose(ys, expected)
+
+  def test_slice(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    ys = jax.jit(lambda x: lax.slice_in_dim(x, 1, 3))(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (2, 4))
+
+  def test_dynamic_slice(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    ys = jax.jit(lambda x, i: lax.dynamic_slice_in_dim(x, i, 2))(ks, 1)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (2, 4))
+
+  def test_transpose(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    ys = jax.jit(lambda x: x.T)(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (4, 3))
+
+  def test_gather(self):
+    ks = jax.jit(lambda: make((3, 4)))()
+    ys = jax.jit(lambda x: x[1])(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (4,))
+
+    ks = jax.jit(lambda: make((3, 4, 5)))()
+
+    ys = jax.jit(lambda x: x[1])(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (4, 5))
+
+    ys = jax.jit(lambda x: x[1, 2:4])(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (2, 5))
+
+    ys = jax.jit(lambda x: x[1, 2:4, 3])(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (2,))
+
+    ys = jax.jit(lambda x: x[:, 2:4, 3:4])(ks)
+    self.assertIsInstance(ys, FooArray)
+    self.assertEqual(ys.shape, (3, 2, 1))
+
+  # TODO(frostig,mattjj): more polymorphic primitives tests
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

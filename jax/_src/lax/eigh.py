@@ -24,6 +24,7 @@ import jax._src.numpy.lax_numpy as jnp
 import jax._src.numpy.linalg as jnp_linalg
 from jax import lax
 from jax._src.lax import qdwh
+from jax._src.lax import linalg as lax_linalg
 from jax._src.lax.stack import Stack
 
 
@@ -131,7 +132,7 @@ def _projector_subspace(P, H, n, rank, maxiter=2):
   X = _mask(X, (n, rank))
 
   H_norm = jnp_linalg.norm(H)
-  thresh = 10 * jnp.finfo(X.dtype).eps * H_norm
+  thresh = 10.0 * float(jnp.finfo(X.dtype).eps) * H_norm
 
   # First iteration skips the matmul.
   def body_f_after_matmul(X):
@@ -189,10 +190,10 @@ def split_spectrum(H, n, split_point, V0=None):
     rank: The dynamic size of the m subblock.
   """
   N, _ = H.shape
-  H_shift = H - split_point * jnp.eye(N, dtype=H.dtype)
+  H_shift = H - (split_point * jnp.eye(N, dtype=split_point.dtype)).astype(H.dtype)
   U, _, _, _ = qdwh.qdwh(H_shift, is_hermitian=True, dynamic_shape=(n, n))
   P = -0.5 * (U - _mask(jnp.eye(N, dtype=H.dtype), (n, n)))
-  rank = jnp.round(jnp.trace(P)).astype(jnp.int32)
+  rank = jnp.round(jnp.trace(jnp.real(P))).astype(jnp.int32)
 
   V_minus, V_plus = _projector_subspace(P, H, n, rank)
   H_minus = (V_minus.conj().T @ H) @ V_minus
@@ -330,6 +331,7 @@ def _eigh_work(H, n, termination_size=256):
     eig_vals = _mask(eig_vals, (b,))
     eig_vecs = jnp.dot(V, eig_vecs)
 
+    eig_vals = eig_vals.astype(eig_vecs.dtype)
     blocks = _update_slice(blocks, eig_vals[:, None], (offset, 0), (b, b))
     eigenvectors = _update_slice(eigenvectors, eig_vecs, (0, offset), (n, b))
     return agenda, blocks, eigenvectors
@@ -340,7 +342,7 @@ def _eigh_work(H, n, termination_size=256):
     H = _slice(blocks, (offset, 0), (b, b), (B, B))
     V = _slice(eigenvectors, (0, offset), (n, b), (N, B))
 
-    split_point = jnp.nanmedian(_mask(jnp.diag(H), (b,), jnp.nan))  # TODO: Improve this?
+    split_point = jnp.nanmedian(_mask(jnp.diag(jnp.real(H)), (b,), jnp.nan))  # TODO: Improve this?
     H_minus, V_minus, H_plus, V_plus, rank = split_spectrum(H, b, split_point, V0=V)
 
     blocks = _update_slice(blocks, H_minus, (offset, 0), (rank, rank))
@@ -369,12 +371,11 @@ def _eigh_work(H, n, termination_size=256):
     i = min(2 * i, N)
     buckets.append(i)
     branches.append(partial(recursive_case, i))
-  buckets = jnp.array(buckets)
+  buckets = jnp.array(buckets, dtype='int32')
 
   def loop_body(state):
     agenda, blocks, eigenvectors = state
     (offset, b), agenda = agenda.pop()
-
     which = jnp.where(buckets < b, jnp.iinfo(jnp.int32).max, buckets)
     choice = jnp.argmin(which)
     return lax.switch(choice, branches, offset, b, agenda, blocks, eigenvectors)
@@ -384,16 +385,19 @@ def _eigh_work(H, n, termination_size=256):
   return blocks[:, 0], eigenvectors
 
 
-def eigh(H, *, precision="float32", termination_size=256, n=None):
+def eigh(H, *, precision="float32", termination_size=256, n=None,
+         sort_eigenvalues=True):
   """ Computes the eigendecomposition of the symmetric/Hermitian matrix H.
 
   Args:
-    H: The `n x n` Hermitian input.
+    H: The `n x n` Hermitian input, padded to `N x N`.
     precision: :class:`~jax.lax.Precision` object specifying the matmul precision.
-    symmetrize: If True, `0.5 * (H + H.conj().T)` rather than `H` is used.
     termination_size: Recursion ends once the blocks reach this linear size.
+    n: the true (dynamic) size of the matrix.
+    sort_eigenvalues: If `True`, the eigenvalues will be sorted from lowest to
+      highest.
   Returns:
-    vals: The `n` eigenvalues of `H`, sorted from lowest to highest.
+    vals: The `n` eigenvalues of `H`.
     vecs: A unitary matrix such that `vecs[:, i]` is a normalized eigenvector
       of `H` corresponding to `vals[i]`. We have `H @ vecs = vals * vecs` up
       to numerical error.
@@ -403,7 +407,10 @@ def eigh(H, *, precision="float32", termination_size=256, n=None):
     raise TypeError(f"Input H of shape {H.shape} must be square.")
 
   if N <= termination_size:
-    return jnp_linalg.eigh(H)
+    if n is not None:
+      H = _mask(H, (n, n), jnp.eye(N, dtype=H.dtype))
+    return lax_linalg.eigh_jacobi(
+        H, sort_eigenvalues=sort_eigenvalues)
 
   # TODO(phawkins): consider rounding N up to a larger size to maximize reuse
   # between matrices.
@@ -411,8 +418,9 @@ def eigh(H, *, precision="float32", termination_size=256, n=None):
   n = N if n is None else n
   with jax.default_matmul_precision(precision):
     eig_vals, eig_vecs = _eigh_work(H, n, termination_size=termination_size)
-  eig_vals = _mask(eig_vals, (n,), jnp.nan)
-  sort_idxs = jnp.argsort(eig_vals)
-  eig_vals = eig_vals[sort_idxs]
-  eig_vecs = eig_vecs[:, sort_idxs]
+  eig_vals = _mask(jnp.real(eig_vals), (n,), jnp.nan)
+  if sort_eigenvalues:
+    sort_idxs = jnp.argsort(eig_vals)
+    eig_vals = eig_vals[sort_idxs]
+    eig_vecs = eig_vecs[:, sort_idxs]
   return eig_vals, eig_vecs

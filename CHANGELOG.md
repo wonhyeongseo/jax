@@ -8,9 +8,81 @@ Remember to align the itemized text with the first line of an item within a list
 PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 -->
 
-## jax 0.3.14 (Unreleased)
-* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.13...main).
+## jax 0.3.17 (Unreleased)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.16...main).
+* Bugs
+  * Fix corner case issue in gradient of `lax.pow` with an exponent of zero
+    ({jax-issue}`12041`)
+* Breaking changes
+  * {func}`jax.checkpoint`, also known as {func}`jax.remat`, no longer supports
+    the `concrete` option, following the previous version's deprecation; see
+    [JEP 11830](https://jax.readthedocs.io/en/latest/jep/11830-new-remat-checkpoint.html).
 * Changes
+  * Added {func}`jax.pure_callback` that enables calling back to pure Python functions from compiled functions (e.g. functions decorated with `jax.jit` or `jax.pmap`).
+* Deprecations:
+  * The deprecated `DeviceArray.tile()` method has been removed. Use {func}`jax.numpy.tile`
+    ({jax-issue}`#11944`).
+  * `DeviceArray.to_py()` has been deprecated. Use `np.asarray(x)` instead.
+
+## jax 0.3.16
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.15...main).
+* Breaking changes
+  * Support for NumPy 1.19 has been dropped, per the
+    [deprecation policy](https://jax.readthedocs.io/en/latest/deprecation.html).
+    Please upgrade to NumPy 1.20 or newer.
+* Changes
+  * Added {mod}`jax.debug` that includes utilities for runtime value debugging such at {func}`jax.debug.print` and {func}`jax.debug.breakpoint`.
+  * Added new documentation for [runtime value debugging](debugging/index)
+* Deprecations
+  * {func}`jax.mask` {func}`jax.shapecheck` APIs have been removed.
+    See {jax-issue}`#11557`.
+  * {mod}`jax.experimental.loops` has been removed. See {jax-issue}`#10278`
+    for an alternative API.
+  * {func}`jax.tree_util.tree_multimap` has been removed. It has been deprecated since
+    JAX release 0.3.5, and {func}`jax.tree_util.tree_map` is a direct replacement.
+  * Removed `jax.experimental.stax`; it has long been a deprecated alias of
+    {mod}`jax.example_libraries.stax`.
+  * Removed `jax.experimental.optimizers`; it has long been a deprecated alias of
+    {mod}`jax.example_libraries.optimizers`.
+  * {func}`jax.checkpoint`, also known as {func}`jax.remat`, has a new
+    implementation switched on by default, meaning the old implementation is
+    deprecated; see [JEP 11830](https://jax.readthedocs.io/en/latest/jep/11830-new-remat-checkpoint.html).
+
+## jaxlib 0.3.16 (Unreleased)
+* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.15...main).
+
+## jax 0.3.15 (July 22, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.14...jax-v0.3.15).
+* Changes
+  * `JaxTestCase` and `JaxTestLoader` have been removed from `jax.test_util`. These
+    classes have been deprecated since v0.3.1 ({jax-issue}`#11248`).
+  * Added {class}`jax.scipy.gaussian_kde` ({jax-issue}`#11237`).
+  * Binary operations between JAX arrays and built-in collections (`dict`, `list`, `set`, `tuple`)
+    now raise a `TypeError` in all cases. Previously some cases (particularly equality and inequality)
+    would return boolean scalars inconsistent with similar operations in NumPy ({jax-issue}`#11234`).
+  * Several {mod}`jax.tree_util` routines accessed as top-level JAX package imports are now
+    deprecated, and will be removed in a future JAX release in accordance with the
+    {ref}`api-compatibility` policy:
+    * {func}`jax.treedef_is_leaf` is deprecated in favor of {func}`jax.tree_util.treedef_is_leaf`
+    * {func}`jax.tree_flatten` is deprecated in favor of {func}`jax.tree_util.tree_flatten`
+    * {func}`jax.tree_leaves` is deprecated in favor of {func}`jax.tree_util.tree_leaves`
+    * {func}`jax.tree_structure` is deprecated in favor of {func}`jax.tree_util.tree_structure`
+    * {func}`jax.tree_transpose` is deprecated in favor of {func}`jax.tree_util.tree_transpose`
+    * {func}`jax.tree_unflatten` is deprecated in favor of {func}`jax.tree_util.tree_unflatten`
+  * The `sym_pos` argument of {func}`jax.scipy.linalg.solve` is deprecated in favor of `assume_a='pos'`,
+    following a similar deprecation in {func}`scipy.linalg.solve`.
+
+## jaxlib 0.3.15 (July 22, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.14...jaxlib-v0.3.15).
+
+## jax 0.3.14 (June 27, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.13...jax-v0.3.14).
+* Breaking changes
+  * {func}`jax.experimental.compilation_cache.initialize_cache` does not support
+    `max_cache_size_  bytes` anymore and will not get that as an input.
+  * `JAX_PLATFORMS` now raises an exception when platform initialization fails.
+* Changes
+  * Fixed compatibility problems with NumPy 1.23.
   * {func}`jax.numpy.linalg.slogdet` now accepts an optional `method` argument
     that allows selection between an LU-decomposition based implementation and
     an implementation based on QR decomposition.
@@ -23,11 +95,45 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
       deserialized array will be on the default device.
     - Within function transformations (i.e. traced code), `deepcopy` and `copy`
       previously were no-ops. Now they use the same mechanism as `DeviceArray.copy()`.
-    - Calling `pickle` on a traced array now results in an explicit 
+    - Calling `pickle` on a traced array now results in an explicit
       `ConcretizationTypeError`.
+  * The implementation of singular value decomposition (SVD) and
+    symmetric/Hermitian eigendecomposition should be significantly faster on
+    TPU, especially for matrices above 1000x1000 or so. Both now use a spectral
+    divide-and-conquer algorithm for eigendecomposition (QDWH-eig).
+  * {func}`jax.numpy.ldexp` no longer silently promotes all inputs to float64,
+    instead it promotes to float32 for integer inputs of size int32 or smaller
+    ({jax-issue}`#10921`).
+  * Add a `create_perfetto_link` option to {func}`jax.profiler.start_trace` and
+    {func}`jax.profiler.start_trace`. When used, the profiler will generate a
+    link to the Perfetto UI to view the trace.
+  * Changed the semantics of {func}`jax.profiler.start_server(...)` to store the
+    keepalive globally, rather than requiring the user to keep a reference to
+    it.
+  * Added {func}`jax.random.generalized_normal`.
+  * Added {func}`jax.random.ball`.
+  * Added {func}`jax.default_device`.
+  * Added a `python -m jax.collect_profile` script to manually capture program
+    traces as an alternative to the Tensorboard UI.
+  * Added a `jax.named_scope` context manager that adds profiler metadata to
+    Python programs (similar to `jax.named_call`).
+  * In scatter-update operations (i.e. :attr:`jax.numpy.ndarray.at`), unsafe implicit
+    dtype casts are deprecated, and now result in a `FutureWarning`.
+    In a future release, this will become an error. An example of an unsafe implicit
+    cast is `jnp.zeros(4, dtype=int).at[0].set(1.5)`, in which `1.5` previously was
+    silently truncated to `1`.
+  * {func}`jax.experimental.compilation_cache.initialize_cache` now supports gcs
+    bucket path as input.
+  * Added {func}`jax.scipy.stats.gennorm`.
+  * {func}`jax.numpy.roots` is now better behaved when `strip_zeros=False` when
+    coefficients have leading zeros ({jax-issue}`#11215`).
 
-## jaxlib 0.3.11 (Unreleased)
-* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.10...main).
+## jaxlib 0.3.14 (June 27, 2022)
+* [GitHub commits](https://github.com/google/jax/compare/jaxlib-v0.3.10...jaxlib-v0.3.14).
+  * x86-64 Mac wheels now require Mac OS 10.14 (Mojave) or newer. Mac OS 10.14
+    was released in 2018, so this should not be a very onerous requirement.
+  * The bundled version of NCCL was updated to 2.12.12, fixing some deadlocks.
+  * The Python flatbuffers package is no longer a dependency of jaxlib.
 
 ## jax 0.3.13 (May 16, 2022)
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.3.12...jax-v0.3.13).
@@ -682,7 +788,7 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
     * `TraceContext` --> {func}`~jax.profiler.TraceAnnotation`
     * `StepTraceContext` --> {func}`~jax.profiler.StepTraceAnnotation`
     * `trace_function` --> {func}`~jax.profiler.annotate_function`
-  * Omnistaging can no longer be disabled. See [omnistaging](https://github.com/google/jax/blob/main/design_notes/omnistaging.md)
+  * Omnistaging can no longer be disabled. See [omnistaging](https://github.com/google/jax/blob/main/docs/design_notes/omnistaging.md)
     for more information.
   * Python integers larger than the maximum `int64` value will now lead to an overflow
     in all cases, rather than being silently converted to `uint64` in some cases ({jax-issue}`#6047`).
@@ -942,7 +1048,7 @@ PLEASE REMEMBER TO CHANGE THE '..main' WITH AN ACTUAL TAG in GITHUB LINK.
 * [GitHub commits](https://github.com/google/jax/compare/jax-v0.1.77...jax-v0.2.0).
 * Improvements:
   * Omnistaging on by default. See {jax-issue}`#3370` and
-    [omnistaging](https://github.com/google/jax/blob/main/design_notes/omnistaging.md)
+    [omnistaging](https://github.com/google/jax/blob/main/docs/design_notes/omnistaging.md)
 
 ## jax (0.1.77) (September 15 2020)
 

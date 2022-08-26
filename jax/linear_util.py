@@ -244,7 +244,16 @@ def annotate(f: WrappedFun,
     return f
   assert (type(in_type) is tuple and all(type(e) is tuple for e in in_type) and
           all(isinstance(a, core.AbstractValue) and type(b) is bool
-              for a, b in in_type))
+              and not isinstance(a, core.ConcreteArray) for a, b in in_type) and
+          all(isinstance(d, (int, core.BInt, core.DBIdx)) for a, _ in in_type
+              if type(a) is core.DShapedArray for d in a.shape))
+  provided = [e for _, e in in_type]
+  for aval, _ in in_type:
+    if type(aval) is core.DShapedArray:
+      for d in aval.shape:
+        if isinstance(d, core.DBIdx):
+          provided[d.val] = True
+  assert all(provided)
   return WrappedFun(f.f, f.transforms, f.stores, f.params, in_type)
 
 
@@ -273,10 +282,11 @@ def cache(call: Callable):
     cache = fun_caches.setdefault(fun.f, {})
     if config.jax_check_tracer_leaks:
       key = (_copy_main_traces(fun.transforms), fun.params, fun.in_type, args,
-             config.x64_enabled, config._trace_context())
+             config.x64_enabled, config.jax_default_device,
+             config._trace_context())
     else:
-      key = (fun.transforms, fun.params, fun.in_type, args,
-             config.x64_enabled, config._trace_context())
+      key = (fun.transforms, fun.params, fun.in_type, args, config.x64_enabled,
+             config.jax_default_device, config._trace_context())
     result = cache.get(key, None)
     if result is not None:
       ans, stores = result
@@ -295,8 +305,12 @@ def cache(call: Callable):
       thread_local.most_recent_entry = None
       return result
 
+  def _evict_function(f):
+    fun_caches.pop(f, None)
+
   memoized_fun.most_recent_entry = _most_recent_entry  # type: ignore
   memoized_fun.cache_clear = fun_caches.clear  # type: ignore
+  memoized_fun.evict_function = _evict_function  # type: ignore
 
   return memoized_fun
 

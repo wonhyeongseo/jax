@@ -304,7 +304,8 @@ def _generic_reduce_window_lower(ctx, *args, jaxpr, consts,
       window_strides=mlir.dense_int_elements(window_strides),
       base_dilations=mlir.dense_int_elements(base_dilation),
       window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64)))
+      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
+                                          shape=(len(padding), 2)))
   reducer = rw.regions[0].blocks.append(*(scalar_types + scalar_types))
   with ir.InsertionPoint(reducer):
     if jaxpr.effects:
@@ -417,7 +418,7 @@ def reduce_window_shape_tuple(operand_shape, window_dimensions, window_strides,
     operand_shape = lax._dilate_shape(operand_shape, base_dilation)
   if window_dilation is not None:
     window_dimensions = lax._dilate_shape(window_dimensions, window_dilation)
-  pads_lo, pads_hi = zip(*padding)
+  pads_lo, pads_hi = util.unzip2(padding)
   operand_padded = core.sum_shapes(operand_shape, pads_lo, pads_hi)
   return core.stride_shape(operand_padded, window_dimensions, window_strides)
 
@@ -453,7 +454,8 @@ def _reduce_window_lower(
       window_strides=mlir.dense_int_elements(window_strides),
       base_dilations=mlir.dense_int_elements(base_dilation),
       window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64)))
+      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
+                                          shape=(len(padding), 2)))
   reducer = rw.regions[0].blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(reducer):
     mhlo.ReturnOp(reduce_op(*reducer.arguments))
@@ -498,7 +500,8 @@ def _select_and_scatter_lower(
       init_value,
       window_dimensions=mlir.dense_int_elements(window_dimensions),
       window_strides=mlir.dense_int_elements(window_strides),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64)))
+      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
+                                          shape=(len(padding), 2)))
   select = op.select.blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(select):
     if select_jaxpr.effects:
@@ -643,14 +646,8 @@ def _select_and_gather_add_lowering(
   const = lambda dtype, x: mlir.ir_constant(np.array(x, dtype=dtype),
                                             canonicalize_types=False)
 
-  if jax._src.lib.mlir_api_version >= 9:
-    def _broadcast(x, dims):
-      return mhlo.BroadcastOp(x, mlir.dense_int_elements(dims))
-  else:
-    def _broadcast(x, dims):
-      etype = ir.RankedTensorType(x.type).element_type
-      return mhlo.BroadcastOp(ir.RankedTensorType(dims, etype), x,
-                              mlir.dense_int_elements(dims))
+  def _broadcast(x, dims):
+    return mhlo.BroadcastOp(x, mlir.dense_int_elements(dims))
 
   if double_word_reduction:
     # TODO(b/73062247): XLA doesn't yet implement ReduceWindow on tuples, so
@@ -709,10 +706,10 @@ def _select_and_gather_add_lowering(
     def pack(a, b):
       a_dims = ir.RankedTensorType(a.type).shape
       b_dims = ir.RankedTensorType(b.type).shape
-      a = mhlo.ReducePrecisionOp(a.type, a, exponent_bits=mlir.i32_attr(nexp),
-                                 mantissa_bits=mlir.i32_attr(nmant))
-      b = mhlo.ReducePrecisionOp(b.type, b, exponent_bits=mlir.i32_attr(nexp),
-                                 mantissa_bits=mlir.i32_attr(nmant))
+      a = mhlo.ReducePrecisionOp(a, exponent_bits=mlir.i32_attr(nexp),
+                                  mantissa_bits=mlir.i32_attr(nmant))
+      b = mhlo.ReducePrecisionOp(b, exponent_bits=mlir.i32_attr(nexp),
+                                  mantissa_bits=mlir.i32_attr(nmant))
       a = mhlo.BitcastConvertOp(ir.RankedTensorType.get(a_dims, word_type), a)
       b = mhlo.BitcastConvertOp(ir.RankedTensorType.get(b_dims, word_type), b)
       b = mhlo.ShiftRightLogicalOp(
@@ -743,7 +740,8 @@ def _select_and_gather_add_lowering(
       window_strides=mlir.dense_int_elements(window_strides),
       base_dilations=mlir.dense_int_elements(base_dilation),
       window_dilations=mlir.dense_int_elements(window_dilation),
-      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64)))
+      padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
+                                          shape=(len(padding), 2)))
   scalar_type = ir.RankedTensorType.get([], double_word_type)
   reducer = rw.regions[0].blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(reducer):

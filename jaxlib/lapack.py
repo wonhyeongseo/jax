@@ -28,29 +28,17 @@ for _name, _value in _lapack.registrations().items():
   xla_client.register_custom_call_target(_name, _value, platform="cpu")
 
 
-if xla_client._version >= 64:
-  def _mhlo_u8(x):
-    return mhlo.ConstOp(
-        ir.DenseElementsAttr.get(np.array(x, dtype=np.uint8),
-                                 type=ir.IntegerType.get_unsigned(8))).result
+def _mhlo_u8(x):
+  return mhlo.ConstantOp(
+      ir.DenseElementsAttr.get(
+          np.array(x, dtype=np.uint8),
+          type=ir.IntegerType.get_unsigned(8))).result
 
-  def _mhlo_s32(x):
-    return mhlo.ConstOp(
-        ir.DenseElementsAttr.get(np.array(x, dtype=np.int32),
-                                 type=ir.IntegerType.get_signless(32))).result
-else:
-  def _mhlo_u8(x):
-    typ = ir.RankedTensorType.get([], ir.IntegerType.get_unsigned(8))
-    return mhlo.ConstOp(
-        typ,
-        ir.DenseElementsAttr.get(np.array(x, dtype=np.uint8),
-                                 type=typ.element_type)).result
-
-  def _mhlo_s32(x):
-    typ = ir.RankedTensorType.get([], ir.IntegerType.get_signless(32))
-    return mhlo.ConstOp(
-        typ, ir.DenseElementsAttr.get(np.array(x, dtype=np.int32))).result
-
+def _mhlo_s32(x):
+  return mhlo.ConstantOp(
+      ir.DenseElementsAttr.get(
+          np.array(x, dtype=np.int32),
+          type=ir.IntegerType.get_signless(32))).result
 
 # TODO(phawkins): it would be nice to avoid duplicating code for each type.
 

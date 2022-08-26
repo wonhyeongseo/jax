@@ -22,14 +22,37 @@ using IREE to compile and run JAX computations instead of XLA.
 
 from __future__ import annotations
 
+import os
+import platform
 from typing import Any, List, Sequence, Optional
 
 import iree.compiler
-from iree import runtime as iree_runtime
+import iree.runtime
 
+from jax._src.config import flags
 from jax._src.lib import xla_client
 import numpy as np
 
+FLAGS = flags.FLAGS
+
+
+flags.DEFINE_string(
+    'jax_iree_backend', os.getenv('JAX_IREE_BACKEND', 'cpu'),
+    'IREE compiler backend to use.')
+
+iree_compiler_map = {
+  "cpu" : "dylib",
+  "cuda" : "cuda",
+  "vmvx" : "vmvx",
+  "vulkan" : "vulkan-spirv"
+}
+
+iree_runtime_map = {
+  "cpu" : "local-task",
+  "cuda" : "cuda",
+  "vmvx" : "local-task",
+  "vulkan" : "vulkan"
+}
 
 class IreeDevice:
 
@@ -56,20 +79,20 @@ class IreeDevice:
 
 class IreeBuffer(xla_client.DeviceArrayBase):
 
-  def __init__(self, client, device, npy_value):
+  def __init__(self, client, device, buffer):
     self.client = client
     self._device = device
     assert device is not None
-    self._npy_value = np.asarray(npy_value)
+    self._buffer = buffer
 
   def copy_to_device(self, device):
     return self
 
-  def to_py(self) -> np.ndarray:
-    return self._npy_value
+  def __array__(self, dtype=None, context=None):
+    return np.asarray(self._buffer)
 
   def to_iree(self):
-    return self._npy_value
+    return self._buffer
 
   def platform(self):
     return self.client.platform
@@ -79,6 +102,13 @@ class IreeBuffer(xla_client.DeviceArrayBase):
 
   def block_until_ready(self) -> IreeBuffer:
     return self  # no async
+
+  # overrides repr on base class which expects _value and aval attributes
+  def __repr__(self): return f'IreeBuffer({np.asarray(self)})'
+
+  @property
+  def _value(self):
+    return np.asarray(self)
 
 class IreeExecutable:
 
@@ -109,12 +139,15 @@ class IreeClient:
 
   def __init__(self,
                *,
-               compile_target_backends: Sequence[str] = ("cpu",),
-               runtime_driver: str = "dylib"):
+               iree_backend: Optional[str] = None):
     self.platform = "iree"
     self.platform_version = "0.0.1"
     self.runtime_type = "iree"
-    self.iree_config = iree_runtime.system_api.Config(runtime_driver)
+    self.iree_backend = (FLAGS.jax_iree_backend if iree_backend is None
+                        else iree_backend)
+    self.compiler_driver = iree_compiler_map[self.iree_backend]
+    self.runtime_driver = iree_runtime_map[self.iree_backend]
+    self.iree_config = iree.runtime.system_api.Config(self.runtime_driver)
     self._devices = [IreeDevice(self)]
 
   def process_index(self) -> int:
@@ -143,14 +176,19 @@ class IreeClient:
   def compile(self, computation: str,
               compile_options: xla_client.CompileOptions) -> IreeExecutable:
     del compile_options  # Ignored.
+    extra_args = []
+    # extra_args=["--mlir-print-ir-after-all"]
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+      extra_args += ["--iree-llvm-target-triple=arm64-apple-darwin21.5.0"]
     iree_binary = iree.compiler.compile_str(
-        computation, target_backends=["dylib"], input_type="mhlo",
-        # extra_args=["--mlir-print-ir-after-all"],
+        computation, target_backends=[self.compiler_driver], input_type="mhlo",
         # extended_diagnostics=True,
+        extra_args=extra_args,
     )
     # Load it into the runtime.
-    vm_module = iree_runtime.binding.VmModule.from_flatbuffer(iree_binary)
-    module_object = iree_runtime.load_vm_module(vm_module, self.iree_config)
+    vm_module = iree.runtime.VmModule.from_flatbuffer(
+      self.iree_config.vm_instance, iree_binary)
+    module_object = iree.runtime.load_vm_module(vm_module, self.iree_config)
     return IreeExecutable(self, self._devices, module_object, "main")
 
   def buffer_from_pyval(

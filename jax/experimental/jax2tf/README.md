@@ -91,6 +91,7 @@ accuracy w.r.t. the JAX execution:
 ```python
 tf.function(jax2tf.convert(f_jax), autograph=False, jit_compile=True)(x)
 ```
+
 The above happens automatically for JAX code that uses `jax.jit`. E.g.,
 the above is equivalent to:
 
@@ -210,7 +211,7 @@ computation is attempted.
 
 SavedModels enables saving custom derivative rules by using the `experimental_custom_gradients` option:
 
-```
+```python
 options = tf.saved_model.SaveOptions(experimental_custom_gradients=True)
 tf.saved_model.save(model, path, options=options)
 ```
@@ -243,15 +244,26 @@ The graph tensor has name: args_0:0
 ### Saved model for non-differentiable JAX functions
 
 Note that if the JAX function is not reverse-mode differentiable, e.g., uses `lax.while_loop` then
-attempting to save its conversion to a SavedModel will fail with
+attempting to save its conversion to a SavedModel will fail with:
+
 ```
 ValueError: Error when tracing gradients for SavedModel
 ```
 
-You have two options, either pass `enable_gradients=False` to `jax2tf.convert`, or
+You have two options, either pass `with_gradient=False` to `jax2tf.convert`, or
 set `tf.saved_model.SaveOption(experimental_custom_gradients=False)`. In either case,
 you will not be able to compute the gradients of the function loaded from the SavedModel.
 
+## Support for partitioning
+
+jax2tf supports JAX functions that use `jax.pjit`, for single-host meshes.
+The conversion is actually similar as for a `jax.jit`, except that the
+arguments and results will be wrapped with
+`tensorflow.compiler.xla.experimental.xla_sharding.XlaSharding` TensorFlow ops.
+
+Note that when saving a model, the parameters to the model are wrapped with
+`tf.Variable` before calling the converted function (see [above](#saved_model_with_parameters)),
+therefore outside of the `XlaSharding` wrapper.
 
 ## Shape-polymorphic conversion
 
@@ -272,7 +284,7 @@ batch (of unspecified batch size) of 28x28 images.
 For jax2tf it is **additionally** necessary to specify an additional `polymorphic_shapes` parameter
 for the `jax2tf.convert` function:
 
-```
+```python
 f_tf = tf.function(jax2tf.convert(f_jax,
                                   polymorphic_shapes=["(b, 28, 28)"]),
                                   autograph=False)
@@ -305,7 +317,7 @@ image while requiring the images to be square,
 we would add a dimension variable `d` to stand for
 the unknown image size:
 
-```
+```python
 f_tf = tf.function(jax2tf.convert(f_jax, polymorphic_shapes=["(b, d, d)"]), autograph=False)
 f_tf.get_concrete_function(tf.TensorSpec([None, None, None], tf.float32))
 ```
@@ -315,7 +327,6 @@ when the shapes are fully known. For example, given the `"(b, d, d)"`
 specification for the argument `x` of a function, JAX will know that a conditional
 `x.shape[-2] == x.shape[-1]` is `True`, and will also know that `x` and `jnp.sin(x)` have the
 same shape of a batch of square matrices that can be passed to `jnp.matmul`.
-
 
 ### Correctness of shape-polymorphic tracing
 
@@ -419,11 +430,36 @@ The dimension polynomials have the following behavior for arithmetic operations:
     are overloaded, such that `+`, `*`, `np.sum`, `np.prod` work directly on
     dimension polynomials.
     These arise, e.g., in `jax.numpy.concatenate` or `jax.numpy.reshape`.
+
+For example, in the following code to flatten a 2D array, the computation
+`x.shape[0] * x.shape[1]` computes the dimension polynomial `4 * b`:
+
+```python
+jax2tf.convert(lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],)),
+                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4))
+```
+
+Replacing the multiplication with `np.prod(x.shape)` would also
+work. Note that the dimension polynomials can be used only as shape arguments
+to JAX functions. If you try to use them in place of array arguments you will get
+an error:
+
+```python
+jax2tf.convert(lambda x: jnp.prod(x.shape),
+                polymorphic_shapes=["(b, 4)"])(np.ones((3, 4))
+Uncaught exception TypeError: "Argument 'b' of type <class 'jax.experimental.jax2tf.shape_poly._DimPolynomial'> is not a valid JAX type"
+```
+
+See below for how you can turn a dimension polynomial into a JAX value.
+
+More operations are partially supported for dimension polynomials:
+
   * division is a special case. It is also overloaded, but it is only partially
     supported, when either (a) there is no remainder, or (b) the divisor is a constant
     in which case there may be a constant remainder. The need for division in JAX core
     arises in a couple of specific situations, e.g.,
     `jax.numpy.reshape(-1)` and operations involving striding.
+    See [#division-of-shape-polynomials-is-partially-supported](below) for a discussion.
   * equality and disequality are partially supported. They result in a boolean value only when
     the same result would be obtained for any valuation of the dimension variables. In
     other situations, an exception `core.InconclusiveDimensionOperation` is raised.
@@ -439,28 +475,15 @@ For example, the following code raises the exception
 `core.InconclusiveDimensionOperation` with the message
 `Dimension polynomial comparison 'a + 1' == 'b' is inconclusive`.
 
-```
+```python
 jax2tf.convert(lambda x: 0 if x.shape[0] + 1 == x.shape[1] else 1,
-                polymorphic_shapes=["(a, b)"])(np.ones((3, 4))
+                polymorphic_shapes=["(a, b)"])(np.ones((3, 4)))
 ```
 
 Note that it would be unsound for JAX to compute `x.shape[0] + 1 == x.shape[1]`
 as `False` and produce a converted function that returns `1` just because the dimension polynomials
 are not identical: there are some concrete input shapes for which the function
 should return `0`.
-
-Note that JAX will give an error when trying to use a dimension polynomial
-as a JAX value, e.g., in the following code:
-
-```
-jax2tf.convert(lambda x: jnp.prod(jnp.array(x.shape)),
-               polymorphic_shapes=["(b, ...)"])(np.ones((3, 4))
-```
-
-Note that the above code would work if we replace `jnp.array` and `jnp.prod`
-with `np.array`and `np.prod`, because dimension polynomials overload multiplication.
-See the next section if you do need to convert a dimension polynomials to
-a JAX value.
 
 ### Dimension variables appearing in the numeric computation
 
@@ -469,7 +492,7 @@ You can see in the following example how elements from the input shapes
 `(1024, 28, 28)` and `(28, 28)` appear in the computation and specifically
 in the `shape` parameter of the `broadcast_in_dim` JAX primitive.
 
-```
+```python
 def image_mask_jax(images, mask):
   # images: f32[B, W, W]  and mask: f32[W, W]
   return images * mask
@@ -493,7 +516,7 @@ e.g., `b` for `broadcast_in_dim` above, and the parameters, e.g., `broadcast_dim
 The conversion of `image_mask_jax` would use `tf.shape` to compute the
 values of the dimension variables `b` and `w`:
 
-```
+```python
 def image_mask_tf(images, mask):
   b, w, _ = tf.shape(images) # Compute the dynamic values for the dimension variables "b" and "w"
   return tf.math.multiply(images,
@@ -513,7 +536,7 @@ one may encounter other kinds of errors.
 
 When tracing with shape polymorphism we can encounter shape errors:
 
-```
+```python
 four_ones = np.ones((4,))
 jax2tf.convert(lambda x, y: x + y,
                polymorphic_shapes=["(v,)", "(4,)"])(four_ones, four_ones)
@@ -524,7 +547,8 @@ because the shape abstraction is given by the `polymorphic_shapes`, even though 
 actual arguments are more specific and would actually work.
 
 Also,
-```
+
+```python
 jax2tf.convert(lambda x: jnp.matmul(x, x),
              polymorphic_shapes=["(v, 4)"])(np.ones((4, 4)))
 ```
@@ -538,21 +562,37 @@ that `v == 4`, the shape checking rules fail with the above error.
 Since the converted function works only for square matrices, the correct
 `polymorphic_shapes` is `["(v, v)"]`.
 
-You would also encounter shape errors if the code attempts to use the
-dimension variables in unsupported arithmetic operations, such as in the code
-below that fails to compute the inferred dimension for a `reshape` operations:
 
+Certain codes that use shapes in the actual computation may not yet work
+if those shapes are polymorphic. In the code below, the expression `x.shape[0]`
+will have the value of the dimension variable `v`. This case is not yet implemented:
+
+```python
+jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
+               polymorphic_shapes=["(v, _)"])(np.ones((4, 4)))
 ```
+
+### Division of shape polynomials is partially supported
+
+Unlike addition and multiplication, which are fully supported on
+shape polynomials, division is supported when either (a) there
+is no remainder, or (b) the divisor is a constant
+in which case there may be a constant remainder.
+For example, the code below results in a division error when trying to
+compute the inferred dimension for a `reshape` operation:
+
+```python
 jax2tf.convert(lambda x: jnp.reshape(x, (2, -1)),
                polymorphic_shapes=["(b, ...)"])(np.ones((4, 5, 7)))
 ```
 
-In this case you will see the error `Cannot divide evenly the sizes of shapes (b, 5, 7) and (2, -1)`.
-This is because the shape of `x` is `(b, 5, 7)`, with a total size represented as the
-dimension polynomial `35 b`, which is not divisible by `2`.
+In this case you will see the error `Cannot divide evenly the sizes of shapes (b, 5, 7) and (2, -1)`,
+with a further `Details: Cannot divide '35*b' by '-2'`.
+The polynomial `35*b` represents the total size of the input tensor.
+
 Note that the following will succeed:
 
-```
+```python
 ## The resulting symbolic shape is (2, 15 b).
 jax2tf.convert(lambda x: jnp.reshape(x, (2, -1)),
                polymorphic_shapes=["(b, ...)"])(np.ones((4, 5, 6)))
@@ -562,13 +602,18 @@ jax2tf.convert(lambda x: jnp.reshape(x, (-1, x.shape[0])),
                polymorphic_shapes=["(b1, b2, ...)"])(np.ones((4, 5, 6)))
 ```
 
-Finally, certain codes that use shapes in the actual computation may not yet work
-if those shapes are polymorphic. In the code below, the expression `x.shape[0]`
-will have the value of the dimension variable `v`. This case is not yet implemented:
+You may also encounter division errors when working with strides, such as
+when computing the padding in a strided convolution.
 
-```
-jax2tf.convert(lambda x: jnp.sum(x, axis=0) / x.shape[0],
-               polymorphic_shapes=["(v, _)"])(np.ones((4, 4)))
+In some cases you may know that one of the dimension variables
+is a multiple of the divisor,
+e.g., `b` in the above example of dividing `35*b` by `-2` may
+be known to be a multiple of `2`. You can specify that by replacing
+`b` with `2*b` in the polymorphic shape specification:
+
+```python
+jax2tf.convert(lambda x: jnp.reshape(x, (2, -1)),
+               polymorphic_shapes=["(2*b, ...)"])(np.ones((4, 5, 7)))
 ```
 
 ## Known issues
@@ -619,7 +664,7 @@ in [savedmodel_test.py](https://github.com/google/jax/blob/main/jax/experimental
 ### Missing converter features
 
 There is currently no support for `pmap` or`xmap`, nor for the collective
-operations. There is support for `sharded_jit` and `pjit`.
+operations. There is support for `pjit`.
 
 ### SavedModel may be large
 
@@ -678,7 +723,7 @@ Functions converted with `jax2tf.convert` behave the same way under
 `tf.UnconnectedGradients.ZERO`, but by default, they will return
 `None` only for gradients corresponding to integer arguments.
 
-```
+```python
 # x1 and x3 are not used. x3 has integer type.
 def fn(x0, x1, x2, x3):
   return x0 * 0. + x2 * 2.
@@ -727,7 +772,7 @@ eager and with `tf.function`, but you won't be able to save it to a SavedModel, 
 will you be able to compute gradients with TensorFlow
 (code from `jax2tf_test.test_custom_pytree_readme`):
 
-```
+```python
 class CustomPair:
   def __init__(self, a, b):
     self.a = a
@@ -751,7 +796,7 @@ res_tf_2 = tf.function(jax2tf.convert(f_jax), autograph=False, jit_compile=True)
 If you want to save the function in a SavedModel or compute gradients,
 you should construct a wrapper:
 
-```
+```python
  # wrapped TF function to use only standard containers
 def f_tf_wrapped(a, b):
   return f_tf(CustomPair(a, b))
@@ -778,8 +823,8 @@ grad_jax = jax.grad(f_jax)(x)
 x_v = [tf.Variable(x.a), tf.Variable(x.b)]
 with tf.GradientTape() as tape:
   res = f_tf_wrapped(*x_v)
-
   grad_tf = tape.gradient(res, x_v)
+
 self.assertAllClose(grad_jax.a, grad_tf[0])
 self.assertAllClose(grad_jax.b, grad_tf[1])
 ```
@@ -800,7 +845,7 @@ TensorFlow always does. JAX goes further, it forces
 all explicitly-specified 64-bit values to be interpreted as
 32-bit:
 
-```
+```python
 # with JAX_ENABLE_X64=0
 jnp.sin(3.14)  # Has type float32
 tf.math.sin(3.14)  # Has type float32
@@ -819,7 +864,7 @@ tf.function(jax2tf.convert(jnp.sin))(tf.Variable(3.14, tf.float64))
 When the `JAX_ENABLE_X64` flas is set, JAX uses 64-bit types
 for Python scalars and respects the explicit 64-bit types:
 
-```
+```python
 # with JAX_ENABLE_X64=1
 jnp.sin(3.14)  # Has type float64
 tf.math.sin(3.14)  # Has type float32
@@ -841,7 +886,7 @@ if necessary.
 If you want to create a `tf.Variable` or `tf.TensorSpec` with the
 same dtype, you should use `jax2tf.dtype_of_val`:
 
-```
+```python
 # The following two calls will convert jax_fun at the same dtypes
 # independently of the value of JAX_ENABLE_X64.
 jax2tf.convert(jax_fun)(3.14)
@@ -877,7 +922,7 @@ has different behavior for empty shapes. The broken assumption is caught by jax2
 the converted function is executed eagerly, but not if it is first traced to a
 TensorFlow graph:
 
-```
+```python
 def f_jax(x):
   return 0 if x.shape[0] == 0 else 1
 
@@ -900,7 +945,7 @@ dimensions represented by the same dimension variable have equal size. As before
 this assumption is checked if the converted function is executed eagerly, but
 it may be missed if it is first traced to a TensorFlow graph:
 
-```
+```python
 def f_jax(x):
   return 0 if x.shape[0] != x.shape[1] else 1
 
@@ -960,7 +1005,7 @@ before conversion. (This is a hypothesis, we have not yet verified it extensivel
 
 There is one know case when the performance of the converted code will be different.
 JAX programs use a [stateless
-deterministic PRNG](https://github.com/google/jax/blob/main/design_notes/prng.md)
+deterministic PRNG](https://github.com/google/jax/blob/main/docs/design_notes/prng.md)
 and it has an internal JAX primitive for it.
 This primitive is at the moment converted to a soup of tf.bitwise operations,
 which has a clear performance penalty. We plan to look into using the
@@ -986,6 +1031,34 @@ possibly behave differently, performance-wise or even numerically,
 than either the TensorFlow native or JAX native batch normalization.
 A similar example is that of an LSTM cell.
 
+
+### Errors due to tf.Module magic conversion during attribute assignment
+
+tf.Module will automatically wrap the standard Python container data types into
+trackable classes during attribute assignment.
+Python Dict/List/Tuple are changed to _DictWrapper/_ListWrapper/_TupleWrapper
+classes.
+In most situation, these Wrapper classes work exactly as the standard
+Python data types. However, the low-level pytree data structures are different
+and this can lead to errors.
+
+In such cases, the user can use this walkaround:
+
+```python
+import tensorflow as tf
+input_data = #Any data object
+
+m = tf.Module()
+flat, tree_def = jax.tree_util.tree_flatten(input_data)
+m.input_data = {"flat": flat, "tree_def": tree_def}
+```
+
+Later the user can use `tree_unflatten` for the reverse process:
+
+```python
+input_data = jax.tree_util.tree_unflatten(m.input_data['tree_def'], m.input_data['flat'])
+```
+
 # Calling TensorFlow functions from JAX
 
 The function ```call_tf``` allows JAX functions to call
@@ -999,63 +1072,63 @@ For now, only reverse-mode autodiff is supported for these functions
 As a trivial example, consider computing ``sin(cos(1.))`` with ``sin`` done in JAX and ``cos`` in TF:
 
 ```python
-  from jax.experimental import jax2tf
+from jax.experimental import jax2tf
 
-  # This is a TF function. It will be called with TensorFlow-compatible arguments,
-  # such as `numpy.ndarray`, `tf.Tensor` or `tf.Variable`, or a pytree thereof.
-  # It should return a similar result. This function will be called using
-  # TensorFlow eager mode if called from outside JAX staged contexts (`jit`,
-  # `pmap`, or control-flow primitives), and will be called using TensorFlow
-  # compiled mode otherwise. In the latter case, the function must be compileable
-  # with XLA (`tf.function(func, jit_compile=True)`)
-  def cos_tf(x):
-    return tf.math.cos(x)
+# This is a TF function. It will be called with TensorFlow-compatible arguments,
+# such as `numpy.ndarray`, `tf.Tensor` or `tf.Variable`, or a pytree thereof.
+# It should return a similar result. This function will be called using
+# TensorFlow eager mode if called from outside JAX staged contexts (`jit`,
+# `pmap`, or control-flow primitives), and will be called using TensorFlow
+# compiled mode otherwise. In the latter case, the function must be compileable
+# with XLA (`tf.function(func, jit_compile=True)`)
+def cos_tf(x):
+  return tf.math.cos(x)
 
-  # Compute cos with TF and sin with JAX
-  def cos_tf_sin_jax(x):
-    return jax.numpy.sin(jax2tf.call_tf(cos_tf)(x))
+# Compute cos with TF and sin with JAX
+def cos_tf_sin_jax(x):
+  return jax.numpy.sin(jax2tf.call_tf(cos_tf)(x))
 
-  # Calls `cos_tf` in TF eager mode
-  x = np.float32(1.)
-  cos_tf_sin_jax(x)
+# Calls `cos_tf` in TF eager mode
+x = np.float32(1.)
+cos_tf_sin_jax(x)
 
-  # Compiles `cos_tf` using TF and embeds the XLA computation into the JAX
-  # XLA computation (containing `sin`). The XLA compiler may even be able to
-  # fuse through JAX-TF computations.
-  jax.jit(cos_tf_sin_jax)(x)
+# Compiles `cos_tf` using TF and embeds the XLA computation into the JAX
+# XLA computation (containing `sin`). The XLA compiler may even be able to
+# fuse through JAX-TF computations.
+jax.jit(cos_tf_sin_jax)(x)
 
-  # Uses TF gradient for `cos_tf` and JAX gradient for `sin`
-  jax.grad(cos_tf_sin_jax)(x)
+# Uses TF gradient for `cos_tf` and JAX gradient for `sin`
+jax.grad(cos_tf_sin_jax)(x)
 ```
 
-If you inspect the generated HLO for ``cos_tf_sin_jax`` you will see that the
-main JAX computation (``ENTRY xla_computation_cos_tf_sin_jax``) makes a call to
-the ``a_inference_cos_tf_68__``HLO function that was compiled by TF from ``cos_tf``:
+If you inspect the generated HLO for `cos_tf_sin_jax`, you will see that the
+main JAX computation (`ENTRY xla_computation_cos_tf_sin_jax`) makes a call to
+the `a_inference_cos_tf_68__` HLO function that was compiled by TF from `cos_tf`:
 
 ```
-    HloModule xla_computation_cos_tf_sin_jax.18
+HloModule xla_computation_cos_tf_sin_jax.18
 
-    a_inference_cos_tf_68__.4 {
-      arg0.5 = f32[] parameter(0), parameter_replication={false}
-      reshape.6 = f32[] reshape(arg0.5)
-      cosine.7 = f32[] cosine(reshape.6)
-      reshape.8 = f32[] reshape(cosine.7)
-      tuple.9 = (f32[]) tuple(reshape.8)
-      ROOT get-tuple-element.10 = f32[] get-tuple-element(tuple.9), index=0
-    }
+a_inference_cos_tf_68__.4 {
+  arg0.5 = f32[] parameter(0), parameter_replication={false}
+  reshape.6 = f32[] reshape(arg0.5)
+  cosine.7 = f32[] cosine(reshape.6)
+  reshape.8 = f32[] reshape(cosine.7)
+  tuple.9 = (f32[]) tuple(reshape.8)
+  ROOT get-tuple-element.10 = f32[] get-tuple-element(tuple.9), index=0
+}
 
-    ENTRY xla_computation_cos_tf_sin_jax.18 {
-      constant.2 = pred[] constant(false)
-      constant.3 = pred[] constant(false)
-      parameter.1 = f32[] parameter(0)
-      call.11 = f32[] call(parameter.1), to_apply=a_inference_cos_tf_68__.4
-      tuple.12 = (f32[]) tuple(call.11)
-      get-tuple-element.13 = f32[] get-tuple-element(tuple.12), index=0
-      tuple.14 = (f32[]) tuple(get-tuple-element.13)
-      get-tuple-element.15 = f32[] get-tuple-element(tuple.14), index=0
-      sine.16 = f32[] sine(get-tuple-element.15)
-      ROOT tuple.17 = (f32[]) tuple(sine.16)
-    }
+ENTRY xla_computation_cos_tf_sin_jax.18 {
+  constant.2 = pred[] constant(false)
+  constant.3 = pred[] constant(false)
+  parameter.1 = f32[] parameter(0)
+  call.11 = f32[] call(parameter.1), to_apply=a_inference_cos_tf_68__.4
+  tuple.12 = (f32[]) tuple(call.11)
+  get-tuple-element.13 = f32[] get-tuple-element(tuple.12), index=0
+  tuple.14 = (f32[]) tuple(get-tuple-element.13)
+  get-tuple-element.15 = f32[] get-tuple-element(tuple.14), index=0
+  sine.16 = f32[] sine(get-tuple-element.15)
+  ROOT tuple.17 = (f32[]) tuple(sine.16)
+}
 ```
 
 For a more elaborate example, including round-tripping from JAX
@@ -1077,10 +1150,9 @@ DeviceArray data or for np.ndarray that are aligned on 16-byte
 boundaries) and on GPU (for DeviceArray).
 The zero-copy does not yet work on TPU.
 
-
 ### Limitations of call_tf
 
-The TF function must be compileable (`tf.function(func, jit_compile=True`)
+The TF function must be compileable (`tf.function(func, jit_compile=True)`)
 and must have static output shapes
 when used in a JAX staging context, e.g., `jax.jit`, `lax.scan`, `lax.cond`,
 but not when used in a JAX op-by-op mode. For example, the following
@@ -1115,12 +1187,14 @@ f_jax(x)
 # Fails in jit mode
 jax.jit(f_jax)(x)
 ```
+
 Yet another unsupported situation is when the TF function
 is compileable but with dynamic output shapes:
 
-```
+```python
 def f_tf_dynamic_output_shape(x):
   return tf.cond(x[0] >= 0, lambda: x, lambda: x[1:])
+
 x = np.array([1, 2], dtype=np.int32)
 ```
 
@@ -1135,20 +1209,21 @@ and is used in a JAX jitted context. Calling the ``inpure_func_tf``
 will give an error:
 
 ```python
-       var1 = tf.Variable(1.)
-       def impure_func_tf(x):
-         var1.write(11.)  # BAD: should not write to variables
-         return x + var1
-       jax2tf.call_tf(impure_func_tf)(tf.constant(2.))  # Works in eager mode
-       jax.jit(jax2tf.call_tf(impure_func_tf))(tf.constant(2.))  # Fails in jit mode
+var1 = tf.Variable(1.)
+def impure_func_tf(x):
+  var1.write(11.)  # BAD: should not write to variables
+  return x + var1
+
+jax2tf.call_tf(impure_func_tf)(tf.constant(2.))  # Works in eager mode
+jax.jit(jax2tf.call_tf(impure_func_tf))(tf.constant(2.))  # Fails in jit mode
 ```
 
 The error can be avoided by passing the variable explicitly:
 
 ```python
-       def pure_func_tf(x, var1)
-          new_var1 = 11.
-          return x + new_var1, new_var1
+def pure_func_tf(x, var1)
+  new_var1 = 11.
+  return x + new_var1, new_var1
 ```
 
 This use case is likely to be revisited.

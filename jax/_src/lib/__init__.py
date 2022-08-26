@@ -21,21 +21,6 @@ import os
 import warnings
 from typing import Optional, Tuple
 
-__all__ = [
-  'cuda_linalg', 'cuda_prng', 'cusolver', 'gpu_linalg', 'gpu_prng',
-  'gpu_sparse', 'hip_linalg', 'hip_prng',
-  'hipsolver','jaxlib', 'lapack', 'pocketfft', 'pytree',
-   'tpu_driver_client', 'version', 'xla_client', 'xla_extension',
-]
-
-# Before attempting to import jaxlib, warn about experimental
-# machine configurations.
-if platform.system() == "Darwin" and platform.machine() == "arm64":
-  warnings.warn("JAX on Mac ARM machines is experimental and minimally tested. "
-                "Please see https://github.com/google/jax/issues/5501 in the "
-                "event of problems.")
-
-
 # This apparently-unused import is to work around
 # https://github.com/google/jax/issues/9218#issuecomment-1016949739
 # If the user is using Conda, we want to ensure that Conda's libstdc++ is chosen
@@ -121,71 +106,10 @@ pytree = xla_client._xla.pytree
 jax_jit = xla_client._xla.jax_jit
 pmap_lib = xla_client._xla.pmap_lib
 
-# TODO(phawkins): make gpu_... unconditional after jaxlib >= 0.3.11
-# becomes the minimum; remove cuda_... and hip_....
-
-try:
-  import jaxlib.cusolver as cusolver  # pytype: disable=import-error
-except ImportError:
-  cusolver = None
-
-try:
-  import jaxlib.hipsolver as hipsolver  # pytype: disable=import-error
-except ImportError:
-  hipsolver = None
-
-try:
-  import jaxlib.gpu_solver as gpu_solver  # pytype: disable=import-error
-except ImportError:
-  gpu_solver = None
-
-try:
-  import jaxlib.cusparse as cusparse  # pytype: disable=import-error
-except ImportError:
-  cusparse = None
-
-try:
-  import jaxlib.hipsparse as hipsparse  # pytype: disable=import-error
-except ImportError:
-  hipsparse = None
-
-try:
-  import jaxlib.gpu_sparse as gpu_sparse  # pytype: disable=import-error
-except ImportError:
-  gpu_sparse = None
-
-sparse_apis = cusparse or hipsparse or None
-solver_apis = cusolver or hipsolver or None
-
-try:
-  import jaxlib.cuda_prng as cuda_prng  # pytype: disable=import-error
-except ImportError:
-  cuda_prng = None
-
-try:
-  import jaxlib.hip_prng as hip_prng  # pytype: disable=import-error
-except ImportError:
-  hip_prng = None
-
-try:
-  import jaxlib.gpu_prng as gpu_prng  # pytype: disable=import-error
-except ImportError:
-  gpu_prng = None
-
-try:
-  import jaxlib.cuda_linalg as cuda_linalg  # pytype: disable=import-error
-except ImportError:
-  cuda_linalg = None
-
-try:
-  import jaxlib.hip_linalg as hip_linalg  # pytype: disable=import-error
-except ImportError:
-  hip_linalg = None
-
-try:
-  import jaxlib.gpu_linalg as gpu_linalg  # pytype: disable=import-error
-except ImportError:
-  gpu_linalg = None
+import jaxlib.gpu_solver as gpu_solver  # pytype: disable=import-error
+import jaxlib.gpu_sparse as gpu_sparse  # pytype: disable=import-error
+import jaxlib.gpu_prng as gpu_prng  # pytype: disable=import-error
+import jaxlib.gpu_linalg as gpu_linalg  # pytype: disable=import-error
 
 # Jaxlib code is split between the Jax and the Tensorflow repositories.
 # Only for the internal usage of the JAX developers, we expose a version
@@ -193,8 +117,9 @@ except ImportError:
 # branch on the Jax github.
 xla_extension_version = getattr(xla_client, '_version', 0)
 
-# TODO(phawkins): remove old name
-_xla_extension_version = xla_extension_version
+can_execute_with_token = (
+    xla_extension_version >= 89 and
+    hasattr(xla_client.Executable, "execute_with_token"))
 
 # Version number for MLIR:Python APIs, provided by jaxlib.
 mlir_api_version = xla_client.mlir_api_version

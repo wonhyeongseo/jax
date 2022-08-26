@@ -14,16 +14,77 @@
 
 # JAX is Autograd and XLA
 
+load("//jaxlib:symlink_files.bzl", "symlink_files")
 load(
     "//jaxlib:jax.bzl",
     "flatbuffer_cc_library",
-    "flatbuffer_py_library",
+    "if_windows",
     "pybind_extension",
 )
 
 licenses(["notice"])
 
 package(default_visibility = ["//:__subpackages__"])
+
+py_library(
+    name = "jaxlib",
+    srcs = [
+        "gpu_linalg.py",
+        "gpu_prng.py",
+        "gpu_solver.py",
+        "gpu_sparse.py",
+        "init.py",
+        "lapack.py",
+        "mhlo_helpers.py",
+        "pocketfft.py",
+        ":version",
+        ":xla_client",
+    ],
+    data = [":xla_extension"],
+    deps = [
+        ":_lapack",
+        ":_pocketfft",
+        ":cpu_feature_guard",
+        "//jaxlib/mlir",
+        "//jaxlib/mlir:builtin_dialect",
+        "//jaxlib/mlir:func_dialect",
+        "//jaxlib/mlir:ir",
+        "//jaxlib/mlir:mhlo_dialect",
+        "//jaxlib/mlir:ml_program_dialect",
+        "//jaxlib/mlir:pass_manager",
+        "//jaxlib/mlir:sparse_tensor_dialect",
+    ],
+)
+
+symlink_files(
+    name = "version",
+    srcs = ["//jax:version.py"],
+    dst = ".",
+    flatten = True,
+)
+
+symlink_files(
+    name = "xla_client",
+    srcs = ["@org_tensorflow//tensorflow/compiler/xla/python:xla_client"],
+    dst = ".",
+    flatten = True,
+)
+
+symlink_files(
+    name = "xla_extension",
+    srcs = if_windows(
+        ["@org_tensorflow//tensorflow/compiler/xla/python:xla_extension.pyd"],
+        ["@org_tensorflow//tensorflow/compiler/xla/python:xla_extension.so"],
+    ),
+    dst = ".",
+    flatten = True,
+)
+
+exports_files([
+    "README.md",
+    "setup.py",
+    "setup.cfg",
+])
 
 cc_library(
     name = "kernel_pybind11_helpers",
@@ -68,32 +129,6 @@ cc_library(
         "@com_google_absl//absl/synchronization",
     ],
 )
-
-py_library(
-    name = "jaxlib",
-    srcs = [
-        "gpu_linalg.py",
-        "gpu_prng.py",
-        "gpu_solver.py",
-        "gpu_sparse.py",
-        "init.py",
-        "lapack.py",
-        "mhlo_helpers.py",
-        "pocketfft.py",
-        "version.py",
-    ],
-    deps = [
-        ":_lapack",
-        ":_pocketfft",
-        ":cpu_feature_guard",
-        ":pocketfft_flatbuffers_py",
-    ],
-)
-
-exports_files([
-    "setup.py",
-    "setup.cfg",
-])
 
 # CPU kernels
 
@@ -148,11 +183,6 @@ flatbuffer_cc_library(
     srcs = ["pocketfft.fbs"],
 )
 
-flatbuffer_py_library(
-    name = "pocketfft_flatbuffers_py",
-    srcs = ["pocketfft.fbs"],
-)
-
 cc_library(
     name = "pocketfft_kernels",
     srcs = ["pocketfft_kernels.cc"],
@@ -178,7 +208,9 @@ pybind_extension(
     module_name = "_pocketfft",
     deps = [
         ":kernel_pybind11_helpers",
+        ":pocketfft_flatbuffers_cc",
         ":pocketfft_kernels",
+        "@flatbuffers//:runtime_cc",
         "@pybind11",
     ],
 )

@@ -16,7 +16,7 @@ import enum
 from dataclasses import dataclass
 from functools import partial
 import itertools as it
-from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet
+from typing import Union, Optional, Callable, Dict, Tuple, TypeVar, FrozenSet, Iterable
 
 import numpy as np
 
@@ -25,9 +25,16 @@ import jax.numpy as jnp
 from jax import core
 from jax import linear_util as lu
 from jax.api_util import flatten_fun
+from jax.experimental import pjit
+from jax.experimental import maps
+from jax.interpreters import batching
+from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
+from jax.experimental.sharding import OpShardingSharding
 from jax.tree_util import tree_flatten, tree_unflatten, register_pytree_node
 from jax._src import source_info_util, traceback_util
+from jax._src.lax import control_flow as cf
+from jax._src.config import config
 from jax import lax
 from jax._src.util import (as_hashable_function, unzip2, split_list, safe_map,
                            safe_zip)
@@ -61,7 +68,7 @@ Payload = Union[np.ndarray, jnp.ndarray, core.Tracer]
 # For now, the payload needs to be a fixed-size array: 3 int32s, used for the
 # OOB message.
 # TODO(lenamartens): Relax this fixed-size constraint.
-init_payload = np.ones((3,), np.int32)
+init_payload = lambda: np.ones((3,), np.int32)
 
 
 def _format_msg(msg, payloads):
@@ -78,7 +85,15 @@ class Error:
   msgs: Dict[int, str]
   # There might be many msgs with a {payload}, but only one msg will
   # ever be active for an Error instance, so only one Payload is tracked.
-  payload: Payload = init_payload
+  payload: Payload
+
+  def __init__(self, err: Bool, code: Int, msgs: Dict[int, str], payload: Optional[Payload] = None):
+    # We can't directly assign to members of a frozen dataclass, even in __init__.
+    object.__setattr__(self, "err", err)
+    object.__setattr__(self, "code", code)
+    object.__setattr__(self, "msgs", msgs)
+    object.__setattr__(self, "payload",
+                       init_payload() if payload is None else payload)
 
   def get(self) -> Optional[str]:
     """Returns error message is error happened, None if no error happened."""
@@ -113,7 +128,7 @@ next_code = it.count(1).__next__  # globally unique ids, could be uuid4
 def assert_func(error: Error, pred: Bool, msg: str,
                 payload: Optional[Payload]) -> Error:
   code = next_code()
-  payload = init_payload if payload is None else payload
+  payload = init_payload() if payload is None else payload
   out_err = error.err | jnp.logical_not(pred)
   out_code = lax.select(error.err, error.code, code)
   out_payload = lax.select(error.err, error.payload, payload)
@@ -457,14 +472,35 @@ def assert_impl(pred, code, payload, *, msgs):
   Error(~pred, code, msgs, payload).throw()
   return []
 
-@assert_p.def_abstract_eval
+CheckEffect = object()
+
+@assert_p.def_effectful_abstract_eval
 def assert_abstract_eval(pred, code, payload, *, msgs):
-  # TODO(lenamartens) add in-depth explanation to link to in module docs.
+  return [], {CheckEffect}
+
+def assert_lowering_rule(*a, **k):
+  # TODO(lenamartens): actually throw an error through emit_python_callable
+  # TODO(lenamartens) add in-depth error explanation to link to in module docs.
   raise ValueError('Cannot abstractly evaluate a checkify.check which was not'
                    ' functionalized. This probably means you tried to stage'
                    ' (jit/scan/pmap/...) a `check` without functionalizing it'
                    ' through `checkify.checkify`.'
                    )
+mlir.register_lowering(assert_p, assert_lowering_rule)
+mlir.lowerable_effects.add(CheckEffect)
+cf.allowed_effects.add(CheckEffect)
+
+
+def assert_batching_rule(batched_args, batch_dims, *, msgs):
+  size = next(x.shape[dim] for x, dim in zip(batched_args, batch_dims)
+              if dim is not batching.not_mapped)
+  pred, code, payload = (batching.bdim_at_front(a, d, size)
+                         for a, d in zip(batched_args, batch_dims))
+  err = Error(jnp.logical_not(pred), code, msgs, payload)
+  check_error(err)
+  return [], []
+
+batching.primitive_batchers[assert_p] = assert_batching_rule
 
 ## checkify rules
 
@@ -498,7 +534,7 @@ def gather_error_check(error, enabled_errors, operand, start_indices, *,
   upper_bound = operand_dims[np.array(dnums.start_index_map)]
   upper_bound -= np.array(slice_sizes)[np.array(dnums.start_index_map)]
   upper_bound = jnp.expand_dims(upper_bound, axis=tuple(range(num_batch_dims)))
-  in_bounds = (start_indices >= 0) & (start_indices <= upper_bound)
+  in_bounds = (start_indices >= 0) & (start_indices <= upper_bound.astype(start_indices.dtype))
 
   # Get first OOB index, axis and axis size so it can be added to the error msg.
   flat_idx = jnp.argmin(in_bounds)
@@ -544,7 +580,7 @@ def scatter_in_bounds(operand, indices, updates, dnums):
                                      (len(indices.shape) - 1,))
 
   lower_in_bounds = jnp.all(jnp.greater_equal(indices, 0))
-  upper_in_bounds = jnp.all(jnp.less_equal(indices, upper_bound))
+  upper_in_bounds = jnp.all(jnp.less_equal(indices, upper_bound.astype(indices.dtype)))
   return jnp.logical_and(lower_in_bounds, upper_in_bounds)
 
 def scatter_error_check(prim, error, enabled_errors, operand, indices, updates,
@@ -611,17 +647,11 @@ def checkify_while_body_jaxpr(cond_jaxpr, body_jaxpr, error, enabled_errors, c_c
   return checkify_fun_to_jaxpr(lu.wrap_init(new_body_f), error, enabled_errors,
                                body_jaxpr.in_avals)
 
-def ignore_errors_jaxpr(jaxpr, error):
-  """Constructs a jaxpr which takes two extra args but ignores them."""
-  err_aval = core.raise_to_shaped(core.get_aval(error.err))
-  code_aval = core.raise_to_shaped(core.get_aval(error.code))
-  payload_aval = core.raise_to_shaped(core.get_aval(error.payload))
+def ignore_error_output_jaxpr(jaxpr):
+  """Constructs a checked jaxpr which does not output its error value."""
   consts = jaxpr.consts
   jaxpr = jaxpr.jaxpr
-  new_vars = core.gensym([jaxpr])
-  new_invars = (new_vars(err_aval), new_vars(code_aval),
-                new_vars(payload_aval), *jaxpr.invars)
-  new_jaxpr = jaxpr.replace(invars=new_invars)
+  new_jaxpr = jaxpr.replace(outvars=jaxpr.outvars[3:])
   return core.ClosedJaxpr(new_jaxpr, consts)
 
 def while_loop_error_check(error, enabled_errors, *in_flat, cond_nconsts,
@@ -629,17 +659,17 @@ def while_loop_error_check(error, enabled_errors, *in_flat, cond_nconsts,
   c_consts, b_consts, carry = split_list(in_flat, [cond_nconsts, body_nconsts])
 
   # Check if the first cond application will error.
-  cond_jaxpr_, msgs_cond = checkify_jaxpr(cond_jaxpr, error, enabled_errors)
-  cond_err, cond_code, cond_payload, _ = core.jaxpr_as_fun(cond_jaxpr_)(
+  checked_cond_jaxpr, msgs_cond = checkify_jaxpr(cond_jaxpr, error,
+                                                 enabled_errors)
+  cond_err, cond_code, cond_payload, _ = core.jaxpr_as_fun(checked_cond_jaxpr)(
       error.err, error.code, error.payload, *c_consts, *carry)
-  del cond_jaxpr_
 
   checked_body_jaxpr_, msgs_body = checkify_while_body_jaxpr(
     cond_jaxpr, body_jaxpr, error, enabled_errors, c_consts)
   to_move = [False] * 3 + [True] * body_nconsts + [False] * len(carry)
   checked_body_jaxpr = pe.move_binders_to_front(checked_body_jaxpr_, to_move)
 
-  compat_cond_jaxpr_ = ignore_errors_jaxpr(cond_jaxpr, error)
+  compat_cond_jaxpr_ = ignore_error_output_jaxpr(checked_cond_jaxpr)
   to_move = [False] * 3 + [True] * cond_nconsts + [False] * len(carry)
   compat_cond_jaxpr = pe.move_binders_to_front(compat_cond_jaxpr_, to_move)
   new_in_flat = [*c_consts, *b_consts, cond_err, cond_code, cond_payload, *carry]
@@ -650,6 +680,46 @@ def while_loop_error_check(error, enabled_errors, *in_flat, cond_nconsts,
   new_msgs = {**error.msgs, **msgs_body, **msgs_cond}
   return out, Error(err, code, new_msgs, payload)
 error_checks[lax.while_p] = while_loop_error_check
+
+
+def pjit_error_check(error, enabled_errors, *vals_in, jaxpr,
+                     in_shardings, out_shardings, resource_env,
+                     donated_invars, name,
+                     in_positional_semantics, out_positional_semantics):
+  checked_jaxpr, msgs = checkify_jaxpr(jaxpr, error, enabled_errors)
+  new_vals_in = [error.err, error.code, error.payload, *vals_in]
+
+  sharding = OpShardingSharding.get_replicated(
+      list(resource_env.physical_mesh.devices.flat))
+  new_in_shardings = (*[sharding] * 3, *in_shardings)
+  new_out_shardings = (*[sharding] * 3, *out_shardings)
+
+  if config.jax_array:
+    pos_sem = maps._PositionalSemantics.GLOBAL
+  else:
+    pos_sem = maps._positional_semantics.val
+
+  if not isinstance(in_positional_semantics, Iterable):
+    in_positional_semantics = (in_positional_semantics,)
+  if not isinstance(out_positional_semantics, Iterable):
+    out_positional_semantics = (out_positional_semantics,)
+  new_positional_sems_in = (*[pos_sem] * 3, *in_positional_semantics)
+  new_positional_sems_out = (*[pos_sem] * 3, *out_positional_semantics)
+  new_donated_invars = (*[False] * 3, *donated_invars)
+
+  err, code, payload, *vals_out = pjit.pjit_p.bind(
+      *new_vals_in,
+      jaxpr=checked_jaxpr,
+      in_shardings=new_in_shardings,
+      out_shardings=new_out_shardings,
+      resource_env=resource_env,
+      donated_invars=new_donated_invars,
+      name=name,
+      in_positional_semantics=new_positional_sems_in,
+      out_positional_semantics=new_positional_sems_out)
+  return vals_out, Error(err, code, msgs, payload)
+error_checks[pjit.pjit_p] = pjit_error_check
+
 
 def add_nan_check(prim):
   error_checks[prim] = partial(nan_error_check, prim)

@@ -12,6 +12,7 @@ Subpackages
     jax.numpy
     jax.scipy
     jax.config
+    jax.debug
     jax.dlpack
     jax.distributed
     jax.example_libraries
@@ -50,6 +51,7 @@ Just-in-time compilation (:code:`jit`)
     device_get
     default_backend
     named_call
+    named_scope
     block_until_ready
 
 .. _jax-grad:
@@ -97,3 +99,12 @@ Parallelization (:code:`pmap`)
     device_count
     local_device_count
     process_count
+
+Callbacks
+---------
+
+.. autosummary::
+  :toctree: _autosummary
+
+    pure_callback
+    debug.callback

@@ -229,6 +229,16 @@ jax.scipy.stats.gamma
    logpdf
    pdf
 
+jax.scipy.stats.gennorm
+~~~~~~~~~~~~~~~~~~~~~~~
+.. automodule:: jax.scipy.stats.gennorm
+.. autosummary::
+  :toctree: _autosummary
+
+   cdf
+   logpdf
+   pdf
+
 jax.scipy.stats.geom
 ~~~~~~~~~~~~~~~~~~~~
 .. automodule:: jax.scipy.stats.geom
@@ -318,3 +328,18 @@ jax.scipy.stats.uniform
 
    logpdf
    pdf
+
+jax.scipy.stats.gaussian_kde
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. currentmodule:: jax.scipy.stats
+.. autosummary::
+  :toctree: _autosummary
+
+   gaussian_kde
+   gaussian_kde.evaluate
+   gaussian_kde.integrate_gaussian
+   gaussian_kde.integrate_box_1d
+   gaussian_kde.integrate_kde
+   gaussian_kde.resample
+   gaussian_kde.pdf
+   gaussian_kde.logpdf

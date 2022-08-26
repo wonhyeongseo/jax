@@ -19,7 +19,7 @@ r"""Jet is an experimental module for higher-order automatic differentiation
   Consider a function :math:`f = g \circ h`, some point :math:`x`
   and some offset :math:`v`.
   First-order automatic differentiation (such as :func:`jax.jvp`)
-  computes the pair :math:`(f(x), \partial f(x)[v])` from the the pair
+  computes the pair :math:`(f(x), \partial f(x)[v])` from the pair
   :math:`(h(x), \partial h(x)[v])`.
 
   :func:`jet` implements the higher-order analogue:
@@ -61,7 +61,6 @@ import numpy as np
 import jax
 from jax import core
 from jax import lax
-from jax.custom_derivatives import custom_jvp_call_jaxpr_p
 from jax.interpreters import xla
 import jax.linear_util as lu
 import jax.numpy as jnp
@@ -326,6 +325,7 @@ deflinear(lax.broadcast_in_dim_p)
 deflinear(lax.concatenate_p)
 deflinear(lax.pad_p)
 deflinear(lax.reshape_p)
+deflinear(lax.squeeze_p)
 deflinear(lax.rev_p)
 deflinear(lax.transpose_p)
 deflinear(lax.slice_p)
@@ -538,7 +538,8 @@ def _atan2_taylor(primals_in, series_in):
   primal_out = lax.atan2(x, y)
 
   x, series = jet(lax.div, primals_in, series_in)
-  c0, cs = jet(lambda x: lax.div(1, 1 + lax.square(x)), (x, ), (series, ))
+  one = lax_internal._const(x, 1)
+  c0, cs = jet(lambda x: lax.div(one, 1 + lax.square(x)), (x, ), (series, ))
   c = [c0] + cs
   u = [x] + series
   v = [primal_out] + [None] * len(series)
@@ -680,13 +681,6 @@ def _lax_min_taylor_rule(primal_in, series_in):
     series_out = [select_min_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
     return primal_out, series_out
 jet_rules[lax.min_p] = _lax_min_taylor_rule
-
-def _custom_jvp_call_jaxpr_rule(primals_in, series_in, *, fun_jaxpr,
-                                jvp_jaxpr_thunk):
-  # TODO(mattjj): do something better than ignoring custom jvp rules for jet?
-  del jvp_jaxpr_thunk
-  return jet(core.jaxpr_as_fun(fun_jaxpr), primals_in, series_in)
-jet_rules[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_rule
 
 def _scatter_add_rule(primals_in, series_in, *, update_jaxpr, update_consts,
                       dimension_numbers, indices_are_sorted, unique_indices,

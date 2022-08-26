@@ -200,7 +200,7 @@ def celu(x: Array, alpha: Array = 1.0) -> Array:
     x : input array
     alpha : array or scalar (default: 1.0)
   """
-  return jnp.where(x > 0, x, alpha * jnp.expm1(x / alpha))
+  return jnp.maximum(x, 0.0) + alpha * jnp.expm1(jnp.minimum(x, 0.0) / alpha)
 
 @jax.jit
 def selu(x: Array) -> Array:
@@ -252,12 +252,17 @@ def gelu(x: Array, approximate: bool = True) -> Array:
     x : input array
     approximate: whether to use the approximate or exact formulation.
   """
+
+  # Promote to nearest float-like dtype.
+  x = x.astype(dtypes.to_inexact_dtype(x.dtype))
+
   if approximate:
     sqrt_2_over_pi = np.sqrt(2 / np.pi).astype(x.dtype)
     cdf = 0.5 * (1.0 + jnp.tanh(sqrt_2_over_pi * (x + 0.044715 * (x ** 3))))
     return x * cdf
   else:
-    return jnp.array(x * (lax.erf(x / np.sqrt(2)) + 1) / 2, dtype=x.dtype)
+    sqrt_2 = np.sqrt(2).astype(x.dtype)
+    return jnp.array(x * (lax.erf(x / sqrt_2) + 1) / 2, dtype=x.dtype)
 
 @partial(jax.jit, static_argnames=("axis",))
 def glu(x: Array, axis: int = -1) -> Array:

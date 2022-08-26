@@ -21,12 +21,15 @@ import itertools
 import os
 import sys
 import threading
-from typing import Any, List, Callable, NamedTuple, Iterator, Optional
+from typing import Any, List, Callable, Hashable, NamedTuple, Iterator, Optional
 import warnings
+
+from absl import logging
 
 from jax._src import lib
 from jax._src.lib import jax_jit
 from jax._src.lib import transfer_guard_lib
+from jax._src.lib import xla_client
 
 def bool_env(varname: str, default: bool) -> bool:
   """Read an environment variable and interpret it as a boolean.
@@ -72,8 +75,6 @@ class Config:
     self.use_absl = False
     self._contextmanager_flags = set()
     self._update_hooks = {}
-
-    self.omnistaging_enabled = True  # TODO(mattjj): remove this
 
   def update(self, name, val):
     if self.use_absl:
@@ -168,22 +169,6 @@ class Config:
       absl.flags.FLAGS(jax_argv, known_only=True)
       self.complete_absl_config(absl.flags)
       already_configured_with_absl = True
-
-      if not FLAGS.jax_omnistaging:
-        raise Exception(
-          "Disabling of omnistaging is no longer supported in JAX version 0.2.12 and higher: "
-          "see https://github.com/google/jax/blob/main/design_notes/omnistaging.md.\n"
-          "To remove this warning, unset the JAX_OMNISTAGING environment variable.")
-
-  def enable_omnistaging(self):
-    warnings.warn(
-        "enable_omnistaging() is a no-op in JAX versions 0.2.12 and higher;\n"
-        "see https://github.com/google/jax/blob/main/design_notes/omnistaging.md")
-
-  def disable_omnistaging(self):
-    raise Exception(
-      "Disabling of omnistaging is no longer supported in JAX version 0.2.12 and higher: "
-      "see https://github.com/google/jax/blob/main/design_notes/omnistaging.md.")
 
   def define_bool_state(
     self, name: str, default: bool, help: str, *,
@@ -324,6 +309,50 @@ class Config:
     Returns:
       A contextmanager to control the thread-local state value.
     """
+
+    def validate(new_val):
+      if new_val is not None and not isinstance(new_val, str):
+        raise ValueError(f'new string config value must be None or of type str,'
+                         f' got {new_val} of type {type(new_val)}.')
+
+    return self.define_string_or_object_state(name, default, help,
+                                              update_global_hook,
+                                              update_thread_local_hook,
+                                              validate)
+
+  def define_string_or_object_state(
+      self,
+      name: str,
+      default: Any,
+      help: str,
+      update_global_hook: Optional[Callable[[Any], None]] = None,
+      update_thread_local_hook: Optional[Callable[[Any], None]] = None,
+      validate_new_val_hook: Optional[Callable[[Any], None]] = None):
+    """Set up thread-local state and return a contextmanager for managing it.
+
+    Similar to ``define_string_state``, except the context manager will accept
+    any object, not just a string. Any value passed via commandline flag or
+    environment variable will be treated as a string.
+
+    Args:
+      name: string, converted to lowercase to define the name of the config
+        option (and absl flag). It is converted to uppercase to define the
+        corresponding shell environment variable.
+      default: string, a default value for the option.
+      help: string, used to populate the flag help information as well as the
+        docstring of the returned context manager.
+      update_global_hook: an optional callback that is called with the updated
+        value of the global state when it is altered or set initially.
+      update_thread_local_hook: an optional callback that is called with the
+        updated value of the thread-local state when it is altered or set
+        initially.
+      validate_new_val_hook: an optional callback that is called with the new
+        value on any update, and should raise an error if the new value is
+        invalid.
+
+    Returns:
+      A contextmanager to control the thread-local state value.
+    """
     name = name.lower()
     default = os.getenv(name.upper(), default)
     self.DEFINE_string(name, default, help=help,
@@ -335,12 +364,8 @@ class Config:
       return val if val is not unset else self._read(name)
     setattr(Config, name, property(get_state))
 
-    def validate(new_val):
-      if new_val is not None and not isinstance(new_val, str):
-        raise ValueError(f"new string config value must be None or of type str,"
-                         f" got {new_val} of type {type(new_val)}.")
-
-    return _StateContextManager(name, help, update_thread_local_hook, validate)
+    return _StateContextManager(name, help, update_thread_local_hook,
+                                validate_new_val_hook)
 
   def _trace_context(self):
     """Returns a tuple of configuration values that affect tracing.
@@ -349,8 +374,15 @@ class Config:
 
     Values included in this set should also most likely be included in
     the C++ JIT state, which is handled separately."""
-    return (self.x64_enabled, self.jax_numpy_rank_promotion,
-            self.jax_default_matmul_precision, self.jax_dynamic_shapes)
+    tls = jax_jit.thread_local_state()
+    axis_env_state = ()
+    context = tls.extra_jit_context
+    if context and context.axis_env_state is not None:
+      axis_env_state = context.axis_env_state
+    return (axis_env_state, self.x64_enabled, self.jax_numpy_rank_promotion,
+            self.jax_default_matmul_precision, self.jax_dynamic_shapes,
+            self.jax_numpy_dtype_promotion, self.jax_default_device,
+            self.jax_array)
 
 class NoDefault: pass
 no_default = NoDefault()
@@ -434,39 +466,61 @@ already_configured_with_absl = False
 # The C++ JIT maintains its own copy of several configuration items as
 # a global/thread-local state. These methods allow updates to part of the
 # state when a configuration value changes.
-
-class GlobalJitState(NamedTuple):
+class _GlobalExtraJitContext(NamedTuple):
   numpy_rank_promotion: Optional[str] = None
+  numpy_dtype_promotion: Optional[str] = None
   default_matmul_precision: Optional[Any] = None
   dynamic_shapes: bool = False
 
 
-def update_global_jit_state(**kw):
+def _update_global_jit_state(**kw):
   gs = jax_jit.global_state()
-  context = gs.extra_jit_context or GlobalJitState()
+  context = gs.extra_jit_context or _GlobalExtraJitContext()
   gs.extra_jit_context = context._replace(**kw)
 
 
-class ThreadLocalJitState(NamedTuple):
+class _ThreadLocalExtraJitContext(NamedTuple):
+  """"A namedtuple containing states to add to the cache key.
+
+  Just in time compilation (for jit, pmap, etc) behavior is configurable through
+  global and thread-local options, used in the cache key.
+
+  The initialization, which uses both config.py and core.py is done using
+  `_update_thread_local_jit_state` in core.py to prevent circular imports.
+  """
   dynamic_trace_state: Optional[Any] = None
+  axis_env_state: Hashable = ()
   numpy_rank_promotion: Optional[str] = None
+  numpy_dtype_promotion: Optional[str] = None
   default_matmul_precision: Optional[Any] = None
   dynamic_shapes: bool = False
+
+
+class _ThreadLocalStateCache(threading.local):
+  """"A thread local cache for _ThreadLocalExtraJitContext
+
+  The extra_jit_context in jax_jit.thread_local_state() may get updated and thus
+  incurring dispatch overhead for comparing this python object during jit calls.
+  We want to duduplicate the objects that have the same hash/equality to also
+  have the same object ID, since the equality check is much faster if the object
+  IDs match.
+  """
+  def __init__(self):
+    self.canonicalize = functools.lru_cache(128)(lambda x: x)
+
+
+_thread_local_state_cache = _ThreadLocalStateCache()
 
 
 def update_thread_local_jit_state(**kw):
   tls = jax_jit.thread_local_state()
-  context = tls.extra_jit_context or ThreadLocalJitState()
-  tls.extra_jit_context = context._replace(**kw)
+  # After xla_client._version >= 70, the thread_local object will necessarily
+  # be initialized when accessed. The following line can be removed when the
+  # minimum  jaxlib version is past version 70
+  context = tls.extra_jit_context or _ThreadLocalExtraJitContext()
+  tmp = context._replace(**kw)
+  tls.extra_jit_context = _thread_local_state_cache.canonicalize(tmp)
 
-
-# TODO(mattjj): remove all uses of this flag
-flags.DEFINE_bool(
-    'jax_omnistaging',
-    bool_env('JAX_OMNISTAGING', True),
-    help=('Deprecated. Setting this flag to False raises an error. Setting it '
-          'to True has no effect.'),
-)
 
 flags.DEFINE_integer(
     'jax_tracer_error_num_traceback_frames',
@@ -529,6 +583,31 @@ jax2tf_associative_scan_reductions = config.define_bool_state(
     )
 )
 
+jax2tf_default_experimental_native_lowering = config.define_bool_state(
+    name='jax2tf_default_experimental_native_lowering',
+    default=bool_env('JAX2TF_DEFAULT_EXPERIMENTAL_NATIVE_LOWERING', False),
+    help=(
+        'DO NOT USE, highly experimental. Sets the default value of the '
+        'experimental_native_lowering parameter to jax2tf.convert.'
+    )
+)
+
+jax_platforms = config.define_string_state(
+    name='jax_platforms',
+    default=None,
+    help=(
+        'Comma-separated list of platform names specifying which platforms jax '
+        'should initialize. If any of the platforms in this list are not successfully '
+        'initialized, an exception will be raised and the program will be aborted. '
+        'The first platform in the list will be the default platform. '
+        'For example, config.jax_platforms=cpu,tpu means that CPU and TPU backends '
+        'will be initialized, and the CPU backend will be used unless otherwise '
+        'specified. If TPU initialization fails, it will raise an exception. '
+        'By default, jax will try to initialize all available '
+        'platforms and will default to GPU or TPU if available, and fallback to CPU '
+        'otherwise.'
+        ))
+
 enable_checks = config.define_bool_state(
     name='jax_enable_checks',
     default=False,
@@ -576,6 +655,7 @@ parallel_functions_output_gda = config.define_bool_state(
 jax_array = config.define_bool_state(
     name='jax_array',
     default=False,
+    upgrade=True,
     help=('If True, new pjit behavior will be enabled and `jax.Array` will be '
           'used.'))
 
@@ -627,6 +707,19 @@ config.define_enum_state(
           'This is a temporary flag that will be used during the process '
           'of deprecating the ``jax_enable_x64`` flag.'))
 
+numpy_dtype_promotion = config.define_enum_state(
+    name='jax_numpy_dtype_promotion',
+    enum_values=['standard', 'strict'],
+    default='standard',
+    help=('Specify the rules used for implicit type promotion in operations '
+          'between arrays. Options are "standard" or "strict"; in strict-mode, '
+          'binary operations between arrays of differing strongly-specified '
+          'dtypes will result in an error.'),
+    update_global_hook=lambda val: \
+      _update_global_jit_state(numpy_dtype_promotion=val),
+    update_thread_local_hook=lambda val: \
+      update_thread_local_jit_state(numpy_dtype_promotion=val))
+
 def _update_x64_global(val):
   lib.jax_jit.global_state().enable_x64 = val
 
@@ -641,9 +734,47 @@ enable_x64 = config.define_bool_state(
     update_thread_local_hook=_update_x64_thread_local)
 
 # TODO(phawkins): remove after fixing users of FLAGS.x64_enabled.
-config._contextmanager_flags.remove("jax_enable_x64")
+config._contextmanager_flags.remove('jax_enable_x64')
 
 Config.x64_enabled = Config.jax_enable_x64  # type: ignore
+
+
+def _update_default_device_global(val):
+  lib.jax_jit.global_state().default_device = val
+
+
+def _update_default_device_thread_local(val):
+  lib.jax_jit.thread_local_state().default_device = val
+
+
+def _validate_default_device(val):
+  if val is not None and not isinstance(val, xla_client.Device):
+    # TODO(skyewm): this is a workaround for non-PJRT Device types. Remove when
+    # all JAX backends use a single C++ device interface.
+    if 'Device' in str(type(val)):
+      logging.info(
+          'Allowing non-`xla_client.Device` default device: %s, type: %s',
+          repr(val), type(val))
+      return
+    raise ValueError('jax.default_device must be passed a Device object (e.g. '
+                     f"`jax.devices('cpu')[0]`), got: {repr(val)}")
+
+
+# TODO(skye): default_device only accepts devices for now. Make it work with
+# platform names as well (e.g. "cpu" to mean the same as jax.devices("cpu")[0]).
+default_device = config.define_string_or_object_state(
+    name='jax_default_device',
+    default=None,
+    help=(
+        'Configure the default device for JAX operations. Set to a Device '
+        'object (e.g. ``jax.devices("cpu")[0]``) to use that Device as the '
+        'default device for JAX operations and jit\'d function calls (there is '
+        'no effect on multi-device computations, e.g. pmapped function calls). '
+        'Set to None to use the system default device. See '
+        ':ref:`faq-data-placement` for more information on device placement.'),
+    update_global_hook=_update_default_device_global,
+    update_thread_local_hook=_update_default_device_thread_local,
+    validate_new_val_hook=_validate_default_device)
 
 def _update_disable_jit_global(val):
   lib.jax_jit.global_state().disable_jit = val
@@ -666,7 +797,7 @@ numpy_rank_promotion = config.define_enum_state(
     help=('Control NumPy-style automatic rank promotion broadcasting '
           '("allow", "warn", or "raise").'),
     update_global_hook=lambda val: \
-      update_global_jit_state(numpy_rank_promotion=val),
+      _update_global_jit_state(numpy_rank_promotion=val),
     update_thread_local_hook=lambda val: \
       update_thread_local_jit_state(numpy_rank_promotion=val))
 
@@ -691,7 +822,7 @@ default_matmul_precision = config.define_enum_state(
           "option is the fastest and least precise; 'float32' is similar to "
           "full float32 precision; 'tensorfloat32' is intermediate.\n\n"),
     update_global_hook=lambda val: \
-      update_global_jit_state(default_matmul_precision=val),
+      _update_global_jit_state(default_matmul_precision=val),
     update_thread_local_hook=lambda val: \
       update_thread_local_jit_state(default_matmul_precision=val))
 
@@ -709,29 +840,35 @@ traceback_filtering = config.define_enum_state(
          " * \"remove_frames\": removes hidden frames from tracebacks, and adds "
          " the unfiltered traceback as a __cause__ of the exception.\n")
 
-# This flag is temporary and for internal use.
-# TODO(tianjianlu): Removes after providing the information in BCOO meta data.
+# This flag is for internal use.
+# TODO(tianjianlu): Removes once we always enable cusparse lowering.
 bcoo_cusparse_lowering = config.define_bool_state(
     name='jax_bcoo_cusparse_lowering',
-    default=False,
+    default=True,
     help=('Enables lowering BCOO ops to cuSparse.'))
 
 # TODO(mattjj): remove this flag when we ensure we only succeed at trace-staging
 # if the intended backend can handle lowering the result
 config.define_bool_state(
     name='jax_dynamic_shapes',
-    default=False,
+    default=bool(os.getenv('JAX_DYNAMIC_SHAPES', '')),
     help=('Enables experimental features for staging out computations with '
           'dynamic shapes.'),
     update_global_hook=lambda val: \
-      update_global_jit_state(dynamic_shapes=val),
+      _update_global_jit_state(dynamic_shapes=val),
     update_thread_local_hook=lambda val: \
       update_thread_local_jit_state(dynamic_shapes=val))
 
 config.define_bool_state(
     name='jax_experimental_name_stack',
-    default=False,
+    default=True,
     help='Enable using the context manager-based name stack.')
+
+config.define_bool_state(
+    name='jax_unique_mhlo_module_names',
+    default=True,
+    help='Enables the generation of unique MHLO module names. This is useful '
+    'to clients that expect modules to have unique names (e.g, trace data).')
 
 # This flag is temporary during rollout of the remat barrier.
 # TODO(parkers): Remove if there are no complaints.
@@ -740,12 +877,27 @@ config.define_bool_state(
     default=(lib.version >= (0, 3, 6)),
     help=('Enables using optimization-barrier op for lowering remat.'))
 
-# TODO(mattjj): remove after May 19 2022, NeurIPS submission deadline
+# TODO(b/205307544): Remove flag once coordination service has rolled out.
 config.define_bool_state(
-    name='after_neurips',
+    name='jax_coordination_service',
+    default=(lib.xla_extension_version >= 80),
+    help=(
+         'Use coordination service (experimental) instead of the default PjRT '
+         'distributed runtime.'
+    )
+)
+
+config.define_bool_state(
+    name='jax_experimental_subjaxpr_lowering_cache',
     default=False,
+    help='Enable using a cache for lowering subjaxprs.')
+
+# TODO(sharadmv,mattjj): set default to True, then remove
+config.define_bool_state(
+    name='jax_eager_pmap',
+    default=True,
     upgrade=True,
-    help='Gate changes until after NeurIPS 2022 deadline.')
+    help='Enable eager-mode pmap when jax_disable_jit is activated.')
 
 @contextlib.contextmanager
 def explicit_device_put_scope() -> Iterator[None]:
@@ -853,7 +1005,17 @@ _transfer_guard = config.define_enum_state(
 
 @contextlib.contextmanager
 def transfer_guard(new_val: str) -> Iterator[None]:
-  """Set up thread-local state and return a contextmanager for managing it."""
+  """A contextmanager to control the transfer guard level for all transfers.
+
+  For more information, see
+  https://jax.readthedocs.io/en/latest/transfer_guard.html
+
+  Args:
+    new_val: The new thread-local transfer guard level for all transfers.
+
+  Yields:
+    None.
+  """
   with contextlib.ExitStack() as stack:
     stack.enter_context(transfer_guard_host_to_device(new_val))
     stack.enter_context(transfer_guard_device_to_device(new_val))

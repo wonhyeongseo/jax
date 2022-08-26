@@ -7,17 +7,24 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 #    and update the sha256 with the result.
 http_archive(
     name = "org_tensorflow",
-    sha256 = "1e5f849805f6a7cb13459d0571b58f0c089d9643804f86d1aa1f73eeb40cc606",
-    strip_prefix = "tensorflow-619dcb55bf16aeaf979f1ea9f51b27cb43a27649",
+    sha256 = "b95682b357f6c693957abce8e5673beceb1fc988642d5cc6ec76a9bc9c7d297e",
+    strip_prefix = "tensorflow-d8ae1c040f73ffdbf77e005b7d2909976fa4b31f",
     urls = [
-        "https://github.com/tensorflow/tensorflow/archive/619dcb55bf16aeaf979f1ea9f51b27cb43a27649.tar.gz",
+        "https://github.com/tensorflow/tensorflow/archive/d8ae1c040f73ffdbf77e005b7d2909976fa4b31f.tar.gz",
     ],
 )
 
-# For development, one can use a local TF repository instead.
+# For development, one often wants to make changes to the TF repository as well
+# as the JAX repository. You can override the pinned repository above with a
+# local checkout by either:
+# a) overriding the TF repository on the build.py command line by passing a flag
+#    like:
+#    python build/build.py --bazel_options=--override_repository=org_tensorflow=/path/to/tensorflow
+#    or
+# b) by commenting out the http_archive above and uncommenting the following:
 # local_repository(
 #    name = "org_tensorflow",
-#    path = "tensorflow",
+#    path = "/path/to/tensorflow",
 # )
 
 load("//third_party/pocketfft:workspace.bzl", pocketfft = "repo")

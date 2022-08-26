@@ -30,6 +30,7 @@ from absl.testing import parameterized
 import numpy as np
 import numpy.random as npr
 
+import jax
 from jax._src import api
 from jax import core
 from jax._src import dtypes as _dtypes
@@ -76,12 +77,12 @@ flags.DEFINE_bool(
 )
 
 flags.DEFINE_string(
-  'test_targets', '',
+  'test_targets', os.getenv('JAX_TEST_TARGETS', ''),
   'Regular expression specifying which tests to run, called via re.search on '
   'the test name. If empty or unspecified, run all tests.'
 )
 flags.DEFINE_string(
-  'exclude_test_targets', '',
+  'exclude_test_targets', os.getenv('JAX_EXCLUDE_TEST_TARGETS', ''),
   'Regular expression specifying which tests NOT to run, called via re.search '
   'on the test name. If empty or unspecified, run all tests.'
 )
@@ -159,7 +160,15 @@ def count_device_put():
 
   def device_put_and_count(*args, **kwargs):
     count[0] += 1
-    return device_put(*args, **kwargs)
+    # device_put handlers might call `dispatch.device_put` (e.g. on an
+    # underlying payload or several). We only want to count these
+    # recursive puts once, so we skip counting more than the outermost
+    # one in such a call stack.
+    dispatch.device_put = device_put
+    try:
+      return device_put(*args, **kwargs)
+    finally:
+      dispatch.device_put = device_put_and_count
 
   dispatch.device_put = device_put_and_count
   try:
@@ -236,8 +245,11 @@ def is_device_rocm():
 def is_device_cuda():
   return xla_bridge.get_backend().platform_version.startswith('cuda')
 
+def is_device_tpu_v4():
+  return jax.devices()[0].device_kind == "TPU v4"
+
 def _get_device_tags():
-  """returns a set of tags definded for the device under test"""
+  """returns a set of tags defined for the device under test"""
   if is_device_rocm():
     device_tags = {device_under_test(), "rocm"}
   elif is_device_cuda():
@@ -303,10 +315,17 @@ def format_test_name_suffix(opname, shapes, dtypes):
 # between NumPy scalars, Python scalars, and 0-D arrays.
 class ScalarShape:
   def __len__(self): return 0
+  def __getitem__(self, i): raise IndexError(f"index {i} out of range.")
 class _NumpyScalar(ScalarShape): pass
 class _PythonScalar(ScalarShape): pass
 NUMPY_SCALAR_SHAPE = _NumpyScalar()
 PYTHON_SCALAR_SHAPE = _PythonScalar()
+
+
+# Some shape combinations don't make sense.
+def is_valid_shape(shape, dtype):
+  if shape == PYTHON_SCALAR_SHAPE:
+    return dtype == np.dtype(type(np.array(0, dtype=dtype).item()))
 
 
 def _dims_of_shape(shape):
@@ -396,9 +415,17 @@ def rand_fullrange(rng, standardize_nans=False):
   """Random numbers that span the full range of available bits."""
   def gen(shape, dtype, post=lambda x: x):
     dtype = np.dtype(dtype)
-    size = dtype.itemsize * np.prod(_dims_of_shape(shape))
+    size = dtype.itemsize * np.prod(_dims_of_shape(shape), dtype=int)
     vals = rng.randint(0, np.iinfo(np.uint8).max, size=size, dtype=np.uint8)
-    vals = post(vals).view(dtype).reshape(shape)
+    vals = post(vals).view(dtype)
+    if shape is PYTHON_SCALAR_SHAPE:
+      # Sampling from the full range of the largest available uint type
+      # leads to overflows in this case; sample from signed ints instead.
+      if dtype == np.uint64:
+        vals = vals.astype(np.int64)
+      elif dtype == np.uint32 and not config.x64_enabled:
+        vals = vals.astype(np.int32)
+    vals = vals.reshape(shape)
     # Non-standard NaNs cause errors in numpy equality assertions.
     if standardize_nans and np.issubdtype(dtype, np.floating):
       vals[np.isnan(vals)] = np.nan
@@ -688,6 +715,7 @@ class JaxTestCase(parameterized.TestCase):
   """Base class for JAX tests including numerical checks and boilerplate."""
   _default_config = {
     'jax_enable_checks': True,
+    'jax_numpy_dtype_promotion': 'strict',
     'jax_numpy_rank_promotion': 'raise',
     'jax_traceback_filtering': 'off',
   }
@@ -864,6 +892,9 @@ class BufferDonationTestCase(JaxTestCase):
   def _assertDeleted(self, x, deleted):
     if hasattr(x, "device_buffer"):
       self.assertEqual(x.device_buffer.is_deleted(), deleted)
+    elif hasattr(x, "_arrays"):
+      for buffer in x._arrays:
+        self.assertEqual(buffer.is_deleted(), deleted)
     else:
       for buffer in x.device_buffers:
         self.assertEqual(buffer.is_deleted(), deleted)
@@ -888,7 +919,7 @@ def with_mesh(named_shape: MeshSpec) -> Generator[None, None, None]:
   local_devices = list(api.local_devices())
   if len(local_devices) < size:
     raise unittest.SkipTest(f"Test requires {size} local devices")
-  mesh_devices = np.array(local_devices[:size]).reshape(shape)
+  mesh_devices = np.array(local_devices[:size]).reshape(shape)  # type: ignore
   with Mesh(mesh_devices, axis_names):
     yield
 
@@ -1009,33 +1040,11 @@ class _LazyDtypes:
 dtypes = _LazyDtypes()
 
 
-class DeprecatedJaxTestCase(JaxTestCase):
-  def __init__(self, *args, **kwargs):
-    warnings.warn(textwrap.dedent("""\
-      jax.test_util.JaxTestCase is deprecated as of jax version 0.3.1:
-      The suggested replacement is to use parametrized.TestCase directly.
-      For tests that rely on custom asserts such as JaxTestCase.assertAllClose(),
-      the suggested replacement is to use standard numpy testing utilities such
-      as np.testing.assert_allclose(), which work directly with JAX arrays."""),
-      category=DeprecationWarning)
-    super().__init__(*args, **kwargs)
-
-
-class DeprecatedJaxTestLoader(JaxTestLoader):
-  def __init__(self, *args, **kwargs):
-    warnings.warn(
-      "jax.test_util.JaxTestLoader is deprecated as of jax version 0.3.1. Use absltest.TestLoader directly.",
-      category=DeprecationWarning)
-    super().__init__(*args, **kwargs)
-
-
-class DeprecatedBufferDonationTestCase(BufferDonationTestCase):
-  def __init__(self, *args, **kwargs):
-    warnings.warn(textwrap.dedent("""\
-      jax.test_util.JaxTestCase is deprecated as of jax version 0.3.1:
-      The suggested replacement is to use parametrized.TestCase directly.
-      For tests that rely on custom asserts such as JaxTestCase.assertAllClose(),
-      the suggested replacement is to use standard numpy testing utilities such
-      as np.testing.assert_allclose(), which work directly with JAX arrays."""),
-      category=DeprecationWarning)
-    super().__init__(*args, **kwargs)
+def strict_promotion_if_dtypes_match(dtypes):
+  """
+  Context manager to enable strict promotion if all dtypes match,
+  and enable standard dtype promotion otherwise.
+  """
+  if all(dtype == dtypes[0] for dtype in dtypes):
+    return jax.numpy_dtype_promotion('strict')
+  return jax.numpy_dtype_promotion('standard')

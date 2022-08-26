@@ -35,19 +35,16 @@ from jax.core import Primitive, ShapedArray, raise_to_shaped
 from jax._src.lax.lax import (
     standard_primitive, standard_unop, naryop_dtype_rule, _float, _complex,
     _input_dtype)
+from jax._src.lax import control_flow
+from jax._src.lax import eigh as lax_eigh
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import svd as lax_svd
-import jax._src.lib
+from jax._src.lib import mlir_api_version
 from jax._src.lib import lapack
 
 from jax._src.lib import gpu_linalg
 from jax._src.lib import gpu_solver
 from jax._src.lib import gpu_sparse
-
-from jax._src.lib import cuda_linalg
-from jax._src.lib import hip_linalg
-from jax._src.lib import sparse_apis
-from jax._src.lib import solver_apis
 
 from jax._src.lib import xla_client
 
@@ -412,12 +409,7 @@ ad.primitive_jvps[cholesky_p] = _cholesky_jvp_rule
 batching.primitive_batchers[cholesky_p] = _cholesky_batching_rule
 
 def _cholesky_lowering(ctx, x):
-  if jax._src.lib.mlir_api_version < 18:
-    aval, = ctx.avals_out
-    return mhlo.CholeskyOp(mlir.aval_to_ir_type(aval), x,
-                           lower=ir.BoolAttr.get(True)).results
-  else:
-    return mhlo.CholeskyOp(x, lower=ir.BoolAttr.get(True)).results
+  return mhlo.CholeskyOp(x, lower=ir.BoolAttr.get(True)).results
 
 mlir.register_lowering(cholesky_p, _cholesky_lowering)
 
@@ -440,22 +432,14 @@ mlir.register_lowering(
     cholesky_p,
     partial(_cholesky_cpu_gpu_lowering, lapack.potrf_mhlo),
     platform='cpu')
-
-if gpu_solver is not None:
-  mlir.register_lowering(
-    cholesky_p,
-    partial(_cholesky_cpu_gpu_lowering, gpu_solver.cuda_potrf),
-    platform='cuda')
-  mlir.register_lowering(
-    cholesky_p,
-    partial(_cholesky_cpu_gpu_lowering, gpu_solver.rocm_potrf),
-    platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-    cholesky_p,
-    partial(_cholesky_cpu_gpu_lowering, solver_apis.potrf_mhlo),
-    platform='gpu')
+mlir.register_lowering(
+  cholesky_p,
+  partial(_cholesky_cpu_gpu_lowering, gpu_solver.cuda_potrf),
+  platform='cuda')
+mlir.register_lowering(
+  cholesky_p,
+  partial(_cholesky_cpu_gpu_lowering, gpu_solver.rocm_potrf),
+  platform='rocm')
 
 # Asymmetric eigendecomposition
 
@@ -574,17 +558,54 @@ ad.primitive_jvps[eig_p] = eig_jvp_rule
 
 # Symmetric/Hermitian eigendecomposition
 
+
+def eigh_jacobi(x, *, lower: bool = True, sort_eigenvalues: bool = True):
+  """Helper Jacobi eigendecomposition implemented by XLA.
+
+  Used as a subroutine of QDWH-eig on TPU."""
+  w, v = eigh_jacobi_p.bind(x, lower=lower, sort_eigenvalues=sort_eigenvalues)
+  return w, v
+
+def _eigh_jacobi_impl(operand, *, lower, sort_eigenvalues):
+  w, v = xla.apply_primitive(eigh_jacobi_p, operand, lower=lower,
+                             sort_eigenvalues=sort_eigenvalues)
+  return w, v
+
+def _eigh_jacobi_abstract_eval(operand, *, lower, sort_eigenvalues):
+  if isinstance(operand, ShapedArray):
+    if operand.ndim < 2 or operand.shape[-2] != operand.shape[-1]:
+      raise ValueError(
+        "Argument to symmetric eigendecomposition must have shape [..., n, n],"
+        "got shape {}".format(operand.shape))
+
+    batch_dims = operand.shape[:-2]
+    n = operand.shape[-1]
+    w = operand.update(shape=batch_dims + (n,),
+                       dtype=lax_internal._complex_basetype(operand.dtype))
+    v = operand.update(shape=batch_dims + (n, n))
+  else:
+    w, v = operand, operand
+  return w, v
+
+def _eigh_jacobi_translation_rule(ctx, avals_in, avals_out, operand, *, lower,
+                                  sort_eigenvalues):
+  operand_aval, = avals_in
+  if operand_aval.shape[-1] == 0:
+    return [xops.Real(xops.Reshape(operand, operand_aval.shape[:-1])), operand]
+  v, w = xops.Eigh(operand, lower=lower, sort_eigenvalues=sort_eigenvalues)
+  return w, v
+
+eigh_jacobi_p = Primitive('eigh_jacobi')
+eigh_jacobi_p.multiple_results = True
+eigh_jacobi_p.def_impl(_eigh_jacobi_impl)
+eigh_jacobi_p.def_abstract_eval(_eigh_jacobi_abstract_eval)
+xla.register_translation(eigh_jacobi_p, _eigh_jacobi_translation_rule)
+
+
 def _eigh_impl(operand, *, lower, sort_eigenvalues):
   v, w = xla.apply_primitive(eigh_p, operand, lower=lower,
                              sort_eigenvalues=sort_eigenvalues)
   return v, w
-
-def _eigh_translation_rule(ctx, avals_in, avals_out, operand, *, lower,
-                           sort_eigenvalues):
-  operand_aval, = avals_in
-  if operand_aval.shape[-1] == 0:
-    return [operand, xops.Real(xops.Reshape(operand, operand_aval.shape[:-1]))]
-  return xops.Eigh(operand, lower=lower, sort_eigenvalues=sort_eigenvalues)
 
 def _eigh_abstract_eval(operand, *, lower, sort_eigenvalues):
   if isinstance(operand, ShapedArray):
@@ -625,6 +646,45 @@ def _eigh_cpu_gpu_lowering(syevd_impl, ctx, operand, *, lower,
       w, _nan_like_mhlo(w_aval))
   return [v, w]
 
+def _eigh_tpu_impl(x, *, lower, sort_eigenvalues):
+  *_, m, n = x.shape
+  assert m == n, (m, n)
+
+  termination_size = 256
+
+  if m <= termination_size:
+    eig_vals, eig_vecs = eigh_jacobi(x, lower=lower,
+                                     sort_eigenvalues=sort_eigenvalues)
+    return eig_vecs, eig_vals
+
+  def eigh_qdwh(x):
+    if len(x.shape) > 2:
+      return control_flow.map(eigh_qdwh, x)
+
+    # We should only look at elements from the lower/upper triangle. Reflects
+    # that triangle into the other triangle to form a Hermitian matrix.
+    if lower:
+      mask = jnp.tri(n, k=0, dtype=bool)
+    else:
+      mask = jnp.logical_not(jnp.tri(n, k=-1, dtype=bool))
+    if dtypes.issubdtype(x.dtype, jnp.complexfloating):
+      re = lax.select(mask, lax.real(x), _T(lax.real(x)))
+      if lower:
+        im_mask = jnp.tri(n, k=-1, dtype=bool)
+      else:
+        im_mask = jnp.logical_not(jnp.tri(n, k=0, dtype=bool))
+      im = lax.select(im_mask, lax.imag(x), jnp.zeros_like(lax.imag(x)))
+      im = lax.select(mask, im, -_T(im))
+      x = lax.complex(re, im)
+    else:
+      x = lax.select(mask, x, _T(x))
+
+    return lax_eigh.eigh(x, sort_eigenvalues=sort_eigenvalues,
+                         termination_size=termination_size)
+
+  eig_vals, eig_vecs = eigh_qdwh(x)
+  return eig_vecs, eig_vals
+
 def _eigh_jvp_rule(primals, tangents, *, lower, sort_eigenvalues):
   # Derivative for eigh in the simplest case of distinct eigenvalues.
   # This is classic nondegenerate perurbation theory, but also see
@@ -663,7 +723,6 @@ eigh_p = Primitive('eigh')
 eigh_p.multiple_results = True
 eigh_p.def_impl(_eigh_impl)
 eigh_p.def_abstract_eval(_eigh_abstract_eval)
-xla.register_translation(eigh_p, _eigh_translation_rule)
 ad.primitive_jvps[eigh_p] = _eigh_jvp_rule
 batching.primitive_batchers[eigh_p] = _eigh_batching_rule
 
@@ -679,11 +738,9 @@ if gpu_solver is not None:
     eigh_p, partial(_eigh_cpu_gpu_lowering, gpu_solver.rocm_syevd),
     platform='rocm')
 
-
-if solver_apis is not None:
-  mlir.register_lowering(
-    eigh_p, partial(_eigh_cpu_gpu_lowering, solver_apis.syevd_mhlo),
-    platform='gpu')
+mlir.register_lowering(
+    eigh_p, mlir.lower_fun(_eigh_tpu_impl, multiple_results=True),
+    platform='tpu')
 
 
 triangular_solve_dtype_rule = partial(
@@ -867,21 +924,14 @@ def _triangular_solve_gpu_lower(
                                   ir.BoolAttr.get(unit_diagonal),
                                   mhlo.TransposeAttr.get(transpose)).results
 
-if gpu_solver is not None:
-  mlir.register_lowering(
-      triangular_solve_p,
-      partial(_triangular_solve_gpu_lower, gpu_solver.cuda_trsm),
-      platform='cuda')
-  mlir.register_lowering(
-      triangular_solve_p,
-      partial(_triangular_solve_gpu_lower, gpu_solver.rocm_trsm),
-      platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-      triangular_solve_p,
-      partial(_triangular_solve_gpu_lower, solver_apis.trsm_mhlo),
-      platform='gpu')
+mlir.register_lowering(
+    triangular_solve_p,
+    partial(_triangular_solve_gpu_lower, gpu_solver.cuda_trsm),
+    platform='cuda')
+mlir.register_lowering(
+    triangular_solve_p,
+    partial(_triangular_solve_gpu_lower, gpu_solver.rocm_trsm),
+    platform='rocm')
 
 
 # Support operation for LU decomposition: Transformation of the pivots returned
@@ -971,31 +1021,16 @@ batching.primitive_batchers[lu_pivots_to_permutation_p] = (
 mlir.register_lowering(
     lu_pivots_to_permutation_p,
     mlir.lower_fun(_generic_lu_pivots_to_permutation, multiple_results=False))
-
-if gpu_linalg:
-  mlir.register_lowering(
-      lu_pivots_to_permutation_p,
-      partial(_lu_pivots_to_permutation_gpu_lowering,
-              gpu_linalg.cuda_lu_pivots_to_permutation),
-      platform='cuda')
-  mlir.register_lowering(
-      lu_pivots_to_permutation_p,
-      partial(_lu_pivots_to_permutation_gpu_lowering,
-              gpu_linalg.hip_lu_pivots_to_permutation),
-      platform='rocm')
-
-
-if cuda_linalg:
-  mlir.register_lowering(lu_pivots_to_permutation_p,
-                         partial(_lu_pivots_to_permutation_gpu_lowering,
-                                 cuda_linalg.lu_pivots_to_permutation_mhlo),
-                         platform='cuda')
-
-if hip_linalg:
-  mlir.register_lowering(lu_pivots_to_permutation_p,
-                         partial(_lu_pivots_to_permutation_gpu_lowering,
-                                 hip_linalg.lu_pivots_to_permutation_mhlo),
-                         platform='rocm')
+mlir.register_lowering(
+    lu_pivots_to_permutation_p,
+    partial(_lu_pivots_to_permutation_gpu_lowering,
+            gpu_linalg.cuda_lu_pivots_to_permutation),
+    platform='cuda')
+mlir.register_lowering(
+    lu_pivots_to_permutation_p,
+    partial(_lu_pivots_to_permutation_gpu_lowering,
+            gpu_linalg.hip_lu_pivots_to_permutation),
+    platform='rocm')
 
 
 # LU decomposition
@@ -1154,7 +1189,11 @@ def _lu_cpu_gpu_lowering(getrf_impl, ctx, operand):
   m = operand_aval.shape[-2]
   lu, pivot, info = getrf_impl(operand_aval.dtype, operand)
   # Subtract 1 from the pivot to get 0-based indices.
-  pivot = mhlo.SubOp(pivot, mlir.full_like_aval(1, pivot_aval)).result
+  if mlir_api_version < 29:
+    op = mhlo.SubOp
+  else:
+    op = mhlo.SubtractOp
+  pivot = op(pivot, mlir.full_like_aval(1, pivot_aval)).result
   ok = mlir.compare_mhlo(
       info, mlir.full_like_aval(0, ShapedArray(batch_dims, np.dtype(np.int32))),
       "GE", "SIGNED")
@@ -1164,12 +1203,7 @@ def _lu_cpu_gpu_lowering(getrf_impl, ctx, operand):
                                   ir.IntegerType.get_signless(1)),
           ok, mlir.dense_int_elements(range(len(batch_dims)))).result,
       lu, _nan_like_mhlo(out_aval))
-  sub_ctx = mlir.LoweringRuleContext(module_context=ctx.module_context,
-                                     primitive=None,
-                                     avals_in=[pivot_aval],
-                                     avals_out=[perm_aval],
-                                     tokens_in=ctx.tokens_in,
-                                     tokens_out=ctx.tokens_out)
+  sub_ctx = ctx.replace(primitive=None, avals_in=[pivot_aval], avals_out=[perm_aval])
   perm_fn = mlir.lower_fun(lambda x: lu_pivots_to_permutation(x, m),
                            multiple_results=False)
   perm, = perm_fn(sub_ctx, pivot)
@@ -1192,18 +1226,12 @@ mlir.register_lowering(lu_p,
                        partial(_lu_cpu_gpu_lowering, lapack.getrf_mhlo),
                        platform='cpu')
 
-if gpu_solver is not None:
-  mlir.register_lowering(
-      lu_p, partial(_lu_cpu_gpu_lowering, gpu_solver.cuda_getrf),
-      platform='cuda')
-  mlir.register_lowering(
-      lu_p, partial(_lu_cpu_gpu_lowering, gpu_solver.rocm_getrf),
-      platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-      lu_p, partial(_lu_cpu_gpu_lowering, solver_apis.getrf_mhlo),
-      platform='gpu')
+mlir.register_lowering(
+    lu_p, partial(_lu_cpu_gpu_lowering, gpu_solver.cuda_getrf),
+    platform='cuda')
+mlir.register_lowering(
+    lu_p, partial(_lu_cpu_gpu_lowering, gpu_solver.rocm_getrf),
+    platform='rocm')
 
 xla.register_translation(lu_p, _lu_tpu_translation_rule, platform='tpu')
 
@@ -1337,25 +1365,16 @@ xla.register_translation(geqrf_p, _geqrf_translation_rule)
 mlir.register_lowering(
     geqrf_p, partial(_geqrf_cpu_gpu_lowering, lapack.geqrf_mhlo, None),
     platform='cpu')
-if gpu_solver is not None:
-  # TODO(phawkins): make cuda_geqrf_batched and rocm_geqrf_unbatched
-  # unconditional when jaxlib 0.3.11 is the minimum.
-  mlir.register_lowering(
-      geqrf_p,
-      partial(_geqrf_cpu_gpu_lowering, gpu_solver.cuda_geqrf,
-              getattr(gpu_solver, 'cuda_geqrf_batched', None)),
-      platform='cuda')
-  mlir.register_lowering(
-      geqrf_p,
-      partial(_geqrf_cpu_gpu_lowering, gpu_solver.rocm_geqrf,
-              getattr(gpu_solver, 'rocm_geqrf_batched', None)),
-      platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-      geqrf_p,
-      partial(_geqrf_cpu_gpu_lowering, solver_apis.geqrf_mhlo, None),
-      platform='gpu')
+mlir.register_lowering(
+    geqrf_p,
+    partial(_geqrf_cpu_gpu_lowering, gpu_solver.cuda_geqrf,
+            gpu_solver.cuda_geqrf_batched),
+    platform='cuda')
+mlir.register_lowering(
+    geqrf_p,
+    partial(_geqrf_cpu_gpu_lowering, gpu_solver.rocm_geqrf,
+            gpu_solver.rocm_geqrf_batched),
+    platform='rocm')
 
 
 # orgqr: product of elementary Householder reflectors
@@ -1424,21 +1443,14 @@ xla.register_translation(orgqr_p, _orgqr_translation_rule)
 mlir.register_lowering(
     orgqr_p, partial(_orgqr_cpu_gpu_lowering, lapack.orgqr_mhlo),
     platform='cpu')
-if gpu_solver is not None:
-  mlir.register_lowering(
-      orgqr_p,
-      partial(_orgqr_cpu_gpu_lowering, gpu_solver.cuda_orgqr),
-      platform='cuda')
-  mlir.register_lowering(
-      orgqr_p,
-      partial(_orgqr_cpu_gpu_lowering, gpu_solver.rocm_orgqr),
-      platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-      orgqr_p,
-      partial(_orgqr_cpu_gpu_lowering, solver_apis.orgqr_mhlo),
-      platform='gpu')
+mlir.register_lowering(
+    orgqr_p,
+    partial(_orgqr_cpu_gpu_lowering, gpu_solver.cuda_orgqr),
+    platform='cuda')
+mlir.register_lowering(
+    orgqr_p,
+    partial(_orgqr_cpu_gpu_lowering, gpu_solver.rocm_orgqr),
+    platform='rocm')
 
 
 def _qr_impl(operand, *, full_matrices):
@@ -1482,7 +1494,7 @@ def qr_jvp_rule(primals, tangents, *, full_matrices):
   do = qt_dx_rinv_lower - _H(qt_dx_rinv_lower)  # This is skew-symmetric
   # The following correction is necessary for complex inputs
   I = lax.expand_dims(jnp.eye(n, dtype=do.dtype), range(qt_dx_rinv.ndim - 2))
-  do = do + I * (qt_dx_rinv - jnp.real(qt_dx_rinv))
+  do = do + I * (qt_dx_rinv - qt_dx_rinv.real.astype(qt_dx_rinv.dtype))
   dq = jnp.matmul(q, do - qt_dx_rinv) + dx_rinv
   dr = jnp.matmul(qt_dx_rinv - do, r)
   return (q, r), (dq, dr)
@@ -1519,11 +1531,6 @@ qr_p = Primitive('qr')
 qr_p.multiple_results = True
 qr_p.def_impl(_qr_impl)
 qr_p.def_abstract_eval(_qr_abstract_eval)
-
-# Older jaxlibs didn't expose geqrf and orgqr as separate XLA operations.
-# TODO(phawkins): remove after minimum jaxlib version is > 0.3.10.
-if jax._src.lib.xla_extension_version < 69:
-  xla.register_translation(qr_p, _qr_translation_rule, platform="tpu")
 
 ad.primitive_jvps[qr_p] = qr_jvp_rule
 batching.primitive_batchers[qr_p] = _qr_batching_rule
@@ -1590,23 +1597,23 @@ def _svd_jvp_rule(primals, tangents, *, full_matrices, compute_uv):
   s_diffs_zeros = jnp.eye(s.shape[-1], dtype=s.dtype)  # jnp.ones((), dtype=A.dtype) * (s_diffs == 0.)  # is 1. where s_diffs is 0. and is 0. everywhere else
   s_diffs_zeros = lax.expand_dims(s_diffs_zeros, range(s_diffs.ndim - 2))
   F = 1 / (s_diffs + s_diffs_zeros) - s_diffs_zeros
-  dSS = s_dim * dS  # dS.dot(jnp.diag(s))
-  SdS = _T(s_dim) * dS  # jnp.diag(s).dot(dS)
+  dSS = s_dim.astype(A.dtype) * dS  # dS.dot(jnp.diag(s))
+  SdS = _T(s_dim.astype(A.dtype)) * dS  # jnp.diag(s).dot(dS)
 
-  s_zeros = jnp.ones((), dtype=A.dtype) * (s == 0.)
+  s_zeros = (s == 0).astype(s.dtype)
   s_inv = 1 / (s + s_zeros) - s_zeros
   s_inv_mat = jnp.vectorize(jnp.diag, signature='(k)->(k,k)')(s_inv)
-  dUdV_diag = .5 * (dS - _H(dS)) * s_inv_mat
-  dU = jnp.matmul(U, F * (dSS + _H(dSS)) + dUdV_diag)
-  dV = jnp.matmul(V, F * (SdS + _H(SdS)))
+  dUdV_diag = .5 * (dS - _H(dS)) * s_inv_mat.astype(A.dtype)
+  dU = jnp.matmul(U, F.astype(A.dtype) * (dSS + _H(dSS)) + dUdV_diag)
+  dV = jnp.matmul(V, F.astype(A.dtype) * (SdS + _H(SdS)))
 
   m, n = A.shape[-2:]
   if m > n:
     I = lax.expand_dims(jnp.eye(m, dtype=A.dtype), range(U.ndim - 2))
-    dU = dU + jnp.matmul(I - jnp.matmul(U, Ut), jnp.matmul(dA, V)) / s_dim
+    dU = dU + jnp.matmul(I - jnp.matmul(U, Ut), jnp.matmul(dA, V)) / s_dim.astype(A.dtype)
   if n > m:
     I = lax.expand_dims(jnp.eye(n, dtype=A.dtype), range(V.ndim - 2))
-    dV = dV + jnp.matmul(I - jnp.matmul(V, Vt), jnp.matmul(_H(dA), U)) / s_dim
+    dV = dV + jnp.matmul(I - jnp.matmul(V, Vt), jnp.matmul(_H(dA), U)) / s_dim.astype(A.dtype)
 
   return (s, U, Vt), (ds, dU, _H(dV))
 
@@ -1714,24 +1721,18 @@ batching.primitive_batchers[svd_p] = _svd_batching_rule
 mlir.register_lowering(
     svd_p, partial(_svd_cpu_gpu_lowering, lapack.gesdd_mhlo),
     platform='cpu')
-
-if gpu_solver is not None:
-  mlir.register_lowering(
-    svd_p, partial(_svd_cpu_gpu_lowering, gpu_solver.cuda_gesvd),
-    platform='cuda')
-  mlir.register_lowering(
-    svd_p, partial(_svd_cpu_gpu_lowering, gpu_solver.rocm_gesvd),
-    platform='rocm')
-
-if solver_apis is not None:
-  mlir.register_lowering(
-    svd_p, partial(_svd_cpu_gpu_lowering, solver_apis.gesvd_mhlo),
-    platform='gpu')
+mlir.register_lowering(
+  svd_p, partial(_svd_cpu_gpu_lowering, gpu_solver.cuda_gesvd),
+  platform='cuda')
+mlir.register_lowering(
+  svd_p, partial(_svd_cpu_gpu_lowering, gpu_solver.rocm_gesvd),
+  platform='rocm')
 
 mlir.register_lowering(svd_p, _svd_tpu_lowering_rule)
 
 def _tridiagonal_solve_gpu_lowering(lowering, ctx, dl, d, du, b, *, m, n, ldb, t):
-  return [lowering(dl, d, du, b, m=m, n=n, ldb=ldb, t=t)]
+  return [lowering(dl, d, du, b, m=m, n=n, ldb=ldb,
+                   t=dtypes.canonicalize_dtype(t))]
 
 tridiagonal_solve_p = Primitive('tridiagonal_solve')
 tridiagonal_solve_p.multiple_results = False
@@ -1739,20 +1740,15 @@ tridiagonal_solve_p.def_impl(
     functools.partial(xla.apply_primitive, tridiagonal_solve_p))
 tridiagonal_solve_p.def_abstract_eval(lambda dl, d, du, b, *, m, n, ldb, t: b)
 # TODO(tomhennigan): Consider AD rules using lax.custom_linear_solve?
-if sparse_apis and hasattr(sparse_apis, "gtsv2"):
-  mlir.register_lowering(tridiagonal_solve_p,
-                         _tridiagonal_solve_gpu_lowering,
-                         platform='gpu')
 
-if gpu_sparse:
-  mlir.register_lowering(
-      tridiagonal_solve_p,
-      partial(_tridiagonal_solve_gpu_lowering, gpu_sparse.cuda_gtsv2),
-      platform='cuda')
-  mlir.register_lowering(
-      tridiagonal_solve_p,
-      partial(_tridiagonal_solve_gpu_lowering, gpu_sparse.rocm_gtsv2),
-      platform='rocm')
+mlir.register_lowering(
+    tridiagonal_solve_p,
+    partial(_tridiagonal_solve_gpu_lowering, gpu_sparse.cuda_gtsv2),
+    platform='cuda')
+mlir.register_lowering(
+    tridiagonal_solve_p,
+    partial(_tridiagonal_solve_gpu_lowering, gpu_sparse.rocm_gtsv2),
+    platform='rocm')
 
 
 def _tridiagonal_solve_jax(dl, d, du, b, **kw):
@@ -1884,17 +1880,10 @@ def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
   operand_aval, = ctx.avals_in
   batch_dims = operand_aval.shape[:-2]
 
-  # TODO(jakevdp): remove this try/except when minimum jaxlib >= 0.3.8
-  try:
-    gees_result = lapack.gees_mhlo(operand_aval.dtype, operand,
-                                   jobvs=compute_schur_vectors,
-                                   sort=sort_eig_vals,
-                                   select=select_callable)
-  except TypeError:  # API for jaxlib <= 0.3.7
-    gees_result = lapack.gees_mhlo(operand,  # pytype: disable=missing-parameter
-                                   jobvs=compute_schur_vectors,
-                                   sort=sort_eig_vals,
-                                   select=select_callable)
+  gees_result = lapack.gees_mhlo(operand_aval.dtype, operand,
+                                  jobvs=compute_schur_vectors,
+                                  sort=sort_eig_vals,
+                                  select=select_callable)
   # Number of return values depends on value of sort_eig_vals.
   T, vs, *_, info = gees_result
 

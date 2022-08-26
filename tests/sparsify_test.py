@@ -20,14 +20,29 @@ from absl.testing import parameterized
 
 import numpy as np
 
+import jax
 from jax import config, jit, lax
 import jax.numpy as jnp
 import jax._src.test_util as jtu
 from jax.experimental.sparse import BCOO, sparsify, todense, SparseTracer
 from jax.experimental.sparse.transform import (
   arrays_to_spvalues, spvalues_to_arrays, sparsify_raw, SparsifyValue, SparsifyEnv)
+from jax.experimental.sparse.util import CuSparseEfficiencyWarning
 
 config.parse_flags_with_absl()
+
+def rand_sparse(rng, nse=0.5, post=lambda x: x, rand_method=jtu.rand_default):
+  def _rand_sparse(shape, dtype, nse=nse):
+    rand = rand_method(rng)
+    size = np.prod(shape).astype(int)
+    if 0 <= nse < 1:
+      nse = nse * size
+    nse = min(size, int(nse))
+    M = rand(shape, dtype)
+    indices = rng.choice(size, size - nse, replace=False)
+    M.flat[indices] = 0
+    return post(M)
+  return _rand_sparse
 
 
 class SparsifyTest(jtu.JaxTestCase):
@@ -72,9 +87,12 @@ class SparsifyTest(jtu.JaxTestCase):
     self.assertEqual(len(spvalues), len(args))
     self.assertLen(spenv._buffers, 5)
     self.assertEqual(spvalues,
-        (SparsifyValue(X.shape, 0, None, False),
-         SparsifyValue(X.shape, 1, 2, True),
-         SparsifyValue(X.shape, 3, 4, True)))
+        (SparsifyValue(X.shape, 0, None, indices_sorted=False,
+                       unique_indices=False),
+         SparsifyValue(X.shape, 1, 2, indices_sorted=True,
+                       unique_indices=True),
+         SparsifyValue(X.shape, 3, 4, indices_sorted=True,
+                       unique_indices=True)))
 
     args_out = spvalues_to_arrays(spenv, spvalues)
     self.assertEqual(len(args_out), len(args))
@@ -112,6 +130,7 @@ class SparsifyTest(jtu.JaxTestCase):
     self.assertArraysEqual(args[0], out[0])
     self.assertBcooIdentical(args[1], out[1])
 
+  @jax.numpy_dtype_promotion('standard')  # explicitly exercises implicit dtype promotion.
   def testSparsify(self):
     M_dense = jnp.arange(24).reshape(4, 6)
     M_sparse = BCOO.fromdense(M_dense)
@@ -121,7 +140,10 @@ class SparsifyTest(jtu.JaxTestCase):
     def func(x, v):
       return -jnp.sin(jnp.pi * x).T @ (v + 1)
 
-    result_sparse = func(M_sparse, v)
+    with jtu.ignore_warning(
+        category=CuSparseEfficiencyWarning,
+        message="bcoo_dot_general GPU lowering requires matrices with sorted indices*"):
+      result_sparse = func(M_sparse, v)
     result_dense = func(M_dense, v)
     self.assertAllClose(result_sparse, result_dense)
 
@@ -139,7 +161,7 @@ class SparsifyTest(jtu.JaxTestCase):
     self.assertAllClose(result_sparse.todense(), result_dense)
 
   def testSparseMatmul(self):
-    X = jnp.arange(16).reshape(4, 4)
+    X = jnp.arange(16.0).reshape(4, 4)
     Xsp = BCOO.fromdense(X)
     Y = jnp.ones(4)
     Ysp = BCOO.fromdense(Y)
@@ -156,7 +178,7 @@ class SparsifyTest(jtu.JaxTestCase):
     result_dense = operator.matmul(Y, X)
     self.assertAllClose(result_sparse, result_dense)
 
-    # spdot_general
+  # spdot_general
     result_sparse = self.sparsify(operator.matmul)(Xsp, Ysp)
     result_dense = operator.matmul(X, Y)
     self.assertAllClose(result_sparse.todense(), result_dense)
@@ -183,19 +205,35 @@ class SparsifyTest(jtu.JaxTestCase):
 
     self.assertAllClose(out.todense(), x.todense() + y.todense())
 
-  def testSparseMul(self):
-    x = BCOO.fromdense(jnp.arange(5))
-    y = BCOO.fromdense(2 * jnp.arange(5))
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_{}_nbatch={}_ndense={}_unique_indices={}".format(
+        jtu.format_shape_dtype_string(shape, dtype), n_batch, n_dense,
+          unique_indices),
+       "shape": shape, "dtype": dtype, "n_batch": n_batch, "n_dense": n_dense,
+       "unique_indices": unique_indices}
+      for shape in [(5,), (5, 8), (8, 5), (3, 4, 5), (3, 4, 3, 2)]
+      for dtype in (jtu.dtypes.integer + jtu.dtypes.floating +
+                    jtu.dtypes.complex)
+      for n_batch in range(len(shape) + 1)
+      for n_dense in range(len(shape) + 1 - n_batch)
+      for unique_indices in [True, False]))
+  def testSparseMul(self, shape, dtype, n_batch, n_dense, unique_indices):
+    rng_sparse = rand_sparse(self.rng(), rand_method=jtu.rand_some_zero)
+    x = BCOO.fromdense(rng_sparse(shape, dtype), n_batch=n_batch,
+                       n_dense=n_dense)
 
     # Scalar multiplication
-    out = self.sparsify(operator.mul)(x, 2.5)
-    self.assertArraysEqual(out.todense(), x.todense() * 2.5)
+    scalar = 2
+    y = self.sparsify(operator.mul)(x, scalar)
+    self.assertArraysEqual(x.todense() * scalar, y.todense())
 
     # Shared indices – requires lower level call
     spenv = SparsifyEnv([x.indices, x.data, y.data])
     spvalues = [
-      spenv.sparse(x.shape, data_ref=1, indices_ref=0),
-      spenv.sparse(y.shape, data_ref=2, indices_ref=0)
+      spenv.sparse(x.shape, data_ref=1, indices_ref=0,
+                   unique_indices=unique_indices),
+      spenv.sparse(y.shape, data_ref=2, indices_ref=0,
+                   unique_indices=unique_indices)
     ]
 
     result = sparsify_raw(operator.mul)(spenv, *spvalues)
@@ -430,8 +468,9 @@ class SparsifyTest(jtu.JaxTestCase):
     M = jnp.arange(25).reshape(5, 5)
     M_bcoo = BCOO.fromdense(M)
 
-    result_dense = func(M, x)
-    result_sparse = self.sparsify(func)(M_bcoo, x)
+    with jax.numpy_dtype_promotion('standard'):
+      result_dense = func(M, x)
+      result_sparse = self.sparsify(func)(M_bcoo, x)
 
     self.assertArraysAllClose(result_dense, result_sparse)
 
@@ -484,6 +523,45 @@ class SparsifyTest(jtu.JaxTestCase):
       self.sparsify(operator.mul)(2, Msp).todense(),
       check_dtypes=True,
     )
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op.__name__}", "op": op, "dtype": dtype, "kwds": kwds}
+      for op, dtype, kwds in [
+        (lax.abs, jnp.float32, {}),
+        (lax.asin, jnp.float32, {}),
+        (lax.asinh, jnp.float32, {}),
+        (lax.atan, jnp.float32, {}),
+        (lax.atanh, jnp.float32, {}),
+        (lax.bessel_i1e, jnp.float32, {}),
+        (lax.expm1, jnp.float32, {}),
+        (lax.log1p, jnp.float32, {}),
+        (lax.neg, jnp.float32, {}),
+        (lax.real, jnp.complex64, {}),
+        (lax.imag, jnp.complex64, {}),
+        (lax.sign, jnp.float32, {}),
+        (lax.sin, jnp.float32, {}),
+        (lax.sinh, jnp.float32, {}),
+        (lax.sqrt, jnp.float32, {}),
+        (lax.tan, jnp.float32, {}),
+        (lax.tanh, jnp.float32, {}),
+        (lax.convert_element_type, jnp.float32, {"new_dtype": np.dtype('complex64')})])
+  def testUnaryOperationsNonUniqueIndices(self, op, dtype, kwds):
+    shape = (10,)
+    nse = 5
+
+    # Note: we deliberately test non-unique indices here.
+    rng_idx = jtu.rand_int(self.rng(), low=0, high=10)
+    rng_data = jtu.rand_default(self.rng())
+
+    data = rng_data((nse,), dtype)
+    indices = rng_idx((nse, len(shape)), jnp.int32)
+    mat = BCOO((data, indices), shape=shape)
+
+    sparse_result = self.sparsify(partial(op, **kwds))(mat).todense()
+    dense_result = op(mat.todense(), **kwds)
+
+    self.assertArraysAllClose(sparse_result, dense_result)
+
 
 class SparsifyTracerTest(SparsifyTest):
   @classmethod

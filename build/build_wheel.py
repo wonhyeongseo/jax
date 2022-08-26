@@ -117,15 +117,6 @@ def patch_copy_xla_extension_stubs(dst_dir):
       f.write(src)
 
 
-def patch_copy_xla_client_py(dst_dir):
-  with open(r.Rlocation("org_tensorflow/tensorflow/compiler/xla/python/xla_client.py")) as f:
-    src = f.read()
-    src = src.replace("from tensorflow.compiler.xla.python import xla_extension as _xla",
-                      "from . import xla_extension as _xla")
-    with open(os.path.join(dst_dir, "xla_client.py"), "w") as f:
-      f.write(src)
-
-
 def patch_copy_tpu_client_py(dst_dir):
   with open(r.Rlocation("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client.py")) as f:
     src = f.read()
@@ -172,6 +163,7 @@ def prepare_wheel(sources_path):
 
   verify_mac_libraries_dont_reference_chkstack()
   copy_file("__main__/build/LICENSE.txt", dst_dir=sources_path)
+  copy_file("__main__/jaxlib/README.md", dst_dir=sources_path)
   copy_file("__main__/jaxlib/setup.py", dst_dir=sources_path)
   copy_file("__main__/jaxlib/setup.cfg", dst_dir=sources_path)
   copy_to_jaxlib("__main__/jaxlib/init.py", dst_filename="__init__.py")
@@ -180,14 +172,14 @@ def prepare_wheel(sources_path):
   copy_to_jaxlib(f"__main__/jaxlib/_lapack.{pyext}")
   copy_to_jaxlib("__main__/jaxlib/mhlo_helpers.py")
   copy_to_jaxlib(f"__main__/jaxlib/_pocketfft.{pyext}")
-  copy_to_jaxlib("__main__/jaxlib/pocketfft_flatbuffers_py_generated.py")
   copy_to_jaxlib("__main__/jaxlib/pocketfft.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_prng.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_linalg.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_solver.py")
   copy_to_jaxlib("__main__/jaxlib/gpu_sparse.py")
   copy_to_jaxlib("__main__/jaxlib/version.py")
-
+  copy_to_jaxlib("__main__/jaxlib/xla_client.py")
+  copy_to_jaxlib(f"__main__/jaxlib/xla_extension.{pyext}")
 
   cuda_dir = os.path.join(jaxlib_dir, "cuda")
   if exists(f"__main__/jaxlib/cuda/_cusolver.{pyext}"):
@@ -214,14 +206,11 @@ def prepare_wheel(sources_path):
   mlir_dir = os.path.join(jaxlib_dir, "mlir")
   mlir_dialects_dir = os.path.join(jaxlib_dir, "mlir", "dialects")
   mlir_libs_dir = os.path.join(jaxlib_dir, "mlir", "_mlir_libs")
-  mlir_transforms_dir = os.path.join(jaxlib_dir, "mlir", "transforms")
   os.makedirs(mlir_dir)
   os.makedirs(mlir_dialects_dir)
   os.makedirs(mlir_libs_dir)
-  os.makedirs(mlir_transforms_dir)
   copy_file("__main__/jaxlib/mlir/ir.py", dst_dir=mlir_dir)
   copy_file("__main__/jaxlib/mlir/passmanager.py", dst_dir=mlir_dir)
-  copy_file("__main__/jaxlib/mlir/transforms/__init__.py", dst_dir=mlir_transforms_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_builtin_ops_ext.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_builtin_ops_gen.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_chlo_ops_gen.py", dst_dir=mlir_dialects_dir)
@@ -229,19 +218,22 @@ def prepare_wheel(sources_path):
   copy_file("__main__/jaxlib/mlir/dialects/_ods_common.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_func_ops_ext.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_func_ops_gen.py", dst_dir=mlir_dialects_dir)
+  copy_file("__main__/jaxlib/mlir/dialects/_ml_program_ops_ext.py", dst_dir=mlir_dialects_dir)
+  copy_file("__main__/jaxlib/mlir/dialects/_ml_program_ops_gen.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/_sparse_tensor_ops_gen.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/sparse_tensor.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/builtin.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/chlo.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/mhlo.py", dst_dir=mlir_dialects_dir)
   copy_file("__main__/jaxlib/mlir/dialects/func.py", dst_dir=mlir_dialects_dir)
+  copy_file("__main__/jaxlib/mlir/dialects/ml_program.py", dst_dir=mlir_dialects_dir)
 
+  copy_file("__main__/jaxlib/mlir/_mlir_libs/__init__.py", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlir.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirHlo.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirDialectsSparseTensor.{pyext}", dst_dir=mlir_libs_dir)
   copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirSparseTensorPasses.{pyext}", dst_dir=mlir_libs_dir)
-  copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_mlirTransforms.{pyext}", dst_dir=mlir_libs_dir)
-  copy_to_jaxlib(f"org_tensorflow/tensorflow/compiler/xla/python/xla_extension.{pyext}")
+  copy_file(f"__main__/jaxlib/mlir/_mlir_libs/_site_initialize_0.{pyext}", dst_dir=mlir_libs_dir)
   if _is_windows():
     copy_file("__main__/jaxlib/mlir/_mlir_libs/jaxlib_mlir_capi.dll", dst_dir=mlir_libs_dir)
   elif _is_mac():
@@ -249,9 +241,8 @@ def prepare_wheel(sources_path):
   else:
     copy_file("__main__/jaxlib/mlir/_mlir_libs/libjaxlib_mlir_capi.so", dst_dir=mlir_libs_dir)
   patch_copy_xla_extension_stubs(jaxlib_dir)
-  patch_copy_xla_client_py(jaxlib_dir)
 
-  if not _is_windows():
+  if exists("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so"):
     copy_to_jaxlib("org_tensorflow/tensorflow/compiler/xla/python/tpu_driver/client/tpu_client_extension.so")
     patch_copy_tpu_client_py(jaxlib_dir)
 
@@ -278,7 +269,7 @@ def build_wheel(sources_path, output_path, cpu):
     ("Linux", "x86_64"): ("manylinux2014", "x86_64"),
     ("Linux", "aarch64"): ("manylinux2014", "aarch64"),
     ("Linux", "ppc64le"): ("manylinux2014", "ppc64le"),
-    ("Darwin", "x86_64"): ("macosx_10_9", "x86_64"),
+    ("Darwin", "x86_64"): ("macosx_10_14", "x86_64"),
     ("Darwin", "arm64"): ("macosx_11_0", "arm64"),
     ("Windows", "AMD64"): ("win", "amd64"),
   }[(platform.system(), cpu)]

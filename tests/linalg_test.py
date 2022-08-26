@@ -41,8 +41,6 @@ T = lambda x: np.swapaxes(x, -1, -2)
 float_types = jtu.dtypes.floating
 complex_types = jtu.dtypes.complex
 
-jaxlib_version = jax._src.lib.version
-
 
 class NumpyLinalgTest(jtu.JaxTestCase):
 
@@ -185,9 +183,6 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                      else ["lu", "qr"])
       ))
   def testSlogdet(self, shape, dtype, method):
-    if (method == 'qr' and jax._src.lib.xla_extension_version < 69 and
-        jtu.device_under_test() == "tpu"):
-      raise unittest.SkipTest('qr decomposition is not supported.')
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
     slogdet = partial(jnp.linalg.slogdet, method=method)
@@ -304,7 +299,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     a, = args_maker()
     w1, _ = jnp.linalg.eig(a)
     w2 = jnp.linalg.eigvals(a)
-    self.assertAllClose(w1, w2, rtol={np.complex128: 1e-14})
+    self.assertAllClose(w1, w2, rtol={np.complex64: 1e-5, np.complex128: 1e-14})
 
   @jtu.skip_on_devices("gpu", "tpu")
   def testEigvalsInf(self):
@@ -332,7 +327,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
           jtu.format_shape_dtype_string((n,n), dtype), lower,
           sort_eigenvalues),
        "n": n, "dtype": dtype, "lower": lower}
-      for n in [0, 4, 5, 50]
+      for n in [0, 4, 5, 50, 512]
       for dtype in float_types + complex_types
       for lower in [True, False]
       for sort_eigenvalues in [True, False]))
@@ -347,6 +342,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     a = (a + np.conj(a.T)) / 2
     w, v = jnp.linalg.eigh(np.tril(a) if lower else np.triu(a),
                            UPLO=uplo, symmetrize_input=False)
+    w = w.astype(v.dtype)
     self.assertLessEqual(
         np.linalg.norm(np.eye(n) - np.matmul(np.conj(T(v)), v)), 1e-3)
     with jax.numpy_rank_promotion('allow'):
@@ -362,6 +358,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                   [-1.,  1.,  0., -1.],
                   [1., -1., -1.,  0.]], dtype=np.float32)
     w, v = jnp.linalg.eigh(a)
+    w = w.astype(v.dtype)
     with jax.numpy_rank_promotion('allow'):
       self.assertLessEqual(np.linalg.norm(np.matmul(a, v) - w * v),
                           1e-3 * np.linalg.norm(a))
@@ -438,6 +435,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     new_a = a + a_dot
     new_w, new_v = f(new_a)
     new_a = (new_a + np.conj(new_a.T)) / 2
+    new_w = new_w.astype(new_a.dtype)
     # Assert rtol eigenvalue delta between perturbed eigenvectors vs new true eigenvalues.
     RTOL = 1e-2
     with jax.numpy_rank_promotion('allow'):
@@ -459,7 +457,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
       {"testcase_name":
        f"_shape={jtu.format_shape_dtype_string(shape, dtype)}",
        "shape": shape, "dtype": dtype}
-      for shape in [(1, 1), (4, 4), (5, 5)]
+      for shape in [(1, 1), (4, 4), (5, 5), (300, 300)]
       for dtype in float_types + complex_types))
   def testEighBatching(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
@@ -467,8 +465,9 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     args = rng(shape, dtype)
     args = (args + np.conj(T(args))) / 2
     ws, vs = vmap(jsp.linalg.eigh)(args)
-    self.assertTrue(np.all(np.linalg.norm(
-        np.matmul(args, vs) - ws[..., None, :] * vs) < 1e-3))
+    ws = ws.astype(vs.dtype)
+    norm = np.max(np.linalg.norm(np.matmul(args, vs) - ws[..., None, :] * vs))
+    self.assertTrue(norm < 3e-2)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name":
@@ -540,6 +539,11 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                             tol=1e-3)
     self._CompileAndCheck(jnp_fn, args_maker)
 
+  def testStringInfNorm(self):
+    err, msg = ValueError, r"Invalid order 'inf' for vector norm."
+    with self.assertRaisesRegex(err, msg):
+      jnp.linalg.norm(jnp.array([1.0, 2.0, 3.0]), ord="inf")
+
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_n={}_full_matrices={}_compute_uv={}_hermitian={}".format(
           jtu.format_shape_dtype_string(b + (m, n), dtype), full_matrices,
@@ -580,6 +584,8 @@ class NumpyLinalgTest(jtu.JaxTestCase):
                          hermitian=hermitian)
     if compute_uv:
       # Check the reconstructed matrices
+      out = list(out)
+      out[1] = out[1].astype(out[0].dtype)  # for strict dtype promotion.
       if m and n:
         if full_matrices:
           k = min(m, n)
@@ -594,7 +600,6 @@ class NumpyLinalgTest(jtu.JaxTestCase):
         else:
           max_backward_error = compute_max_backward_error(
               a, np.matmul(out[1][..., None, :] * out[0], out[2]))
-          print(max_backward_error)
           self.assertLess(max_backward_error, reconstruction_tol)
 
       # Check the unitary properties of the singular vector matrices.
@@ -644,7 +649,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
           full_matrices=full_matrices,
           compute_uv=compute_uv)
         vdiag = jnp.vectorize(jnp.diag, signature='(k)->(k,k)')
-        return jnp.matmul(jnp.matmul(u, vdiag(s)), v).real
+        return jnp.matmul(jnp.matmul(u, vdiag(s).astype(u.dtype)), v).real
       _, t_out = jvp(f, (1.,), (1.,))
       if dtype == np.complex128:
         atol = 1e-13
@@ -734,7 +739,6 @@ class NumpyLinalgTest(jtu.JaxTestCase):
       qr = partial(jnp.linalg.qr, mode=mode)
       jtu.check_jvp(qr, partial(jvp, qr), (a,), atol=3e-3)
 
-  @unittest.skipIf(jaxlib_version < (0, 3, 8), "test requires jaxlib>=0.3.8")
   @jtu.skip_on_devices("tpu")
   def testQrInvalidDtypeCPU(self, shape=(5, 6), dtype=np.float16):
     # Regression test for https://github.com/google/jax/issues/10530
@@ -920,7 +924,8 @@ class NumpyLinalgTest(jtu.JaxTestCase):
       {"testcase_name": "_shape={}".format(
            jtu.format_shape_dtype_string(shape, dtype)),
        "shape": shape, "dtype": dtype}
-      for shape in [(3, ), (1, 2), (8, 5), (4, 4), (5, 5), (50, 50)]
+      for shape in [(3, ), (1, 2), (8, 5), (4, 4), (5, 5), (50, 50),
+                    (3, 4, 5), (2, 3, 4, 5)]
       for dtype in float_types + complex_types))
   def testMatrixRank(self, shape, dtype):
     rng = jtu.rand_default(self.rng())
@@ -1154,31 +1159,31 @@ class ScipyLinalgTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name":
-       "_lhs={}_rhs={}_sym_pos={}_lower={}".format(
+       "_lhs={}_rhs={}_assume_a={}_lower={}".format(
            jtu.format_shape_dtype_string(lhs_shape, dtype),
            jtu.format_shape_dtype_string(rhs_shape, dtype),
-           sym_pos, lower),
+           assume_a, lower),
        "lhs_shape": lhs_shape, "rhs_shape": rhs_shape, "dtype": dtype,
-       "sym_pos": sym_pos, "lower": lower}
+       "assume_a": assume_a, "lower": lower}
       for lhs_shape, rhs_shape in [
           ((1, 1), (1, 1)),
           ((4, 4), (4,)),
           ((8, 8), (8, 4)),
       ]
-      for sym_pos, lower in [
-        (False, False),
-        (True, False),
-        (True, True),
+      for assume_a, lower in [
+        ('gen', False),
+        ('pos', False),
+        ('pos', True),
       ]
       for dtype in float_types + complex_types))
-  def testSolve(self, lhs_shape, rhs_shape, dtype, sym_pos, lower):
+  def testSolve(self, lhs_shape, rhs_shape, dtype, assume_a, lower):
     rng = jtu.rand_default(self.rng())
-    osp_fun = lambda lhs, rhs: osp.linalg.solve(lhs, rhs, sym_pos=sym_pos, lower=lower)
-    jsp_fun = lambda lhs, rhs: jsp.linalg.solve(lhs, rhs, sym_pos=sym_pos, lower=lower)
+    osp_fun = lambda lhs, rhs: osp.linalg.solve(lhs, rhs, assume_a=assume_a, lower=lower)
+    jsp_fun = lambda lhs, rhs: jsp.linalg.solve(lhs, rhs, assume_a=assume_a, lower=lower)
 
     def args_maker():
       a = rng(lhs_shape, dtype)
-      if sym_pos:
+      if assume_a == 'pos':
         a = np.matmul(a, np.conj(T(a)))
         a = np.tril(a) if lower else np.triu(a)
       return [a, rng(rhs_shape, dtype)]

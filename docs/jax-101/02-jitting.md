@@ -5,7 +5,7 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.13.8
+    jupytext_version: 1.14.1
 kernelspec:
   display_name: Python 3
   name: python3
@@ -263,7 +263,7 @@ print(g_jit_decorated(10, 20))
 
 ## When to use JIT
 
-In many of the the examples above, jitting is not worth it:
+In many of the examples above, jitting is not worth it:
 
 ```{code-cell} ipython3
 :id: uMOqsNnqYApD

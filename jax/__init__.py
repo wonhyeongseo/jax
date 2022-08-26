@@ -45,8 +45,10 @@ from jax._src.config import (
   debug_nans as debug_nans,
   debug_infs as debug_infs,
   log_compiles as log_compiles,
+  default_device as default_device,
   default_matmul_precision as default_matmul_precision,
   default_prng_impl as default_prng_impl,
+  numpy_dtype_promotion as numpy_dtype_promotion,
   numpy_rank_promotion as numpy_rank_promotion,
   jax2tf_associative_scan_reductions as jax2tf_associative_scan_reductions,
   transfer_guard as transfer_guard,
@@ -61,6 +63,7 @@ from jax._src.api import (
   block_until_ready,
   checkpoint as checkpoint,
   checkpoint_policies as checkpoint_policies,
+  clear_backends as clear_backends,
   closure_convert as closure_convert,
   curry,  # TODO(phawkins): update users to avoid this.
   custom_gradient as custom_gradient,
@@ -92,26 +95,16 @@ from jax._src.api import (
   linearize as linearize,
   linear_transpose as linear_transpose,
   make_jaxpr as make_jaxpr,
-  mask as mask,
   named_call as named_call,
+  named_scope as named_scope,
   pmap as pmap,
   process_count as process_count,
   process_index as process_index,
+  pure_callback as pure_callback,
   pxla,  # TODO(phawkins): update users to avoid this.
   remat as remat,
-  shapecheck as shapecheck,
   ShapedArray as ShapedArray,
   ShapeDtypeStruct as ShapeDtypeStruct,
-  # TODO(phawkins): hide tree* functions from jax, update callers to use
-  # jax.tree_util.
-  treedef_is_leaf,
-  tree_flatten,
-  tree_leaves,
-  tree_map,
-  tree_multimap,
-  tree_structure,
-  tree_transpose,
-  tree_unflatten,
   value_and_grad as value_and_grad,
   vjp as vjp,
   vmap as vmap,
@@ -122,11 +115,23 @@ from jax.experimental.maps import soft_pmap as soft_pmap
 from jax.version import __version__ as __version__
 from jax.version import __version_info__ as __version_info__
 
+from jax._src.tree_util import (
+  tree_map as tree_map,
+  # TODO(jakevdp): remove these deprecated routines after October 2022
+  _deprecated_treedef_is_leaf as treedef_is_leaf,
+  _deprecated_tree_flatten as tree_flatten,
+  _deprecated_tree_leaves as tree_leaves,
+  _deprecated_tree_structure as tree_structure,
+  _deprecated_tree_transpose as tree_transpose,
+  _deprecated_tree_unflatten as tree_unflatten,
+)
+
 # These submodules are separate because they are in an import cycle with
 # jax and rely on the names imported above.
 from jax import abstract_arrays as abstract_arrays
 from jax import api_util as api_util
 from jax import distributed as distributed
+from jax import debug as debug
 from jax import dtypes as dtypes
 from jax import errors as errors
 from jax import image as image

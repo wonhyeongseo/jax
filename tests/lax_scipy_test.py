@@ -30,10 +30,11 @@ import jax
 from jax import numpy as jnp
 from jax import lax
 from jax import scipy as jsp
+from jax.tree_util import tree_map
 from jax._src import test_util as jtu
 from jax.scipy import special as lsp_special
 from jax.scipy import cluster as lsp_cluster
-import jax._src.lax.eigh
+from jax._src.lax import eigh as lax_eigh
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -181,8 +182,11 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     # TODO(mattjj): test autodiff
     if use_b:
       def scipy_fun(array_to_reduce, scale_array):
-        return osp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
-                                     return_sign=return_sign, b=scale_array)
+        res = osp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
+                                    return_sign=return_sign, b=scale_array)
+        if dtype == np.int32:
+          res = tree_map(lambda x: x.astype('float32'), res)
+        return res
 
       def lax_fun(array_to_reduce, scale_array):
         return lsp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
@@ -191,8 +195,11 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
       args_maker = lambda: [rng(shapes[0], dtype), rng(shapes[1], dtype)]
     else:
       def scipy_fun(array_to_reduce):
-        return osp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
-                                     return_sign=return_sign)
+        res = osp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
+                                    return_sign=return_sign)
+        if dtype == np.int32:
+          res = tree_map(lambda x: x.astype('float32'), res)
+        return res
 
       def lax_fun(array_to_reduce):
         return lsp_special.logsumexp(array_to_reduce, axis, keepdims=keepdims,
@@ -242,6 +249,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
           if isinstance(rec.dtypes, list) else itertools.product(*rec.dtypes)))
       for rec in JAX_SPECIAL_FUNCTION_RECORDS))
   @jax.numpy_rank_promotion('allow')  # This test explicitly exercises implicit rank promotion.
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testScipySpecialFun(self, scipy_op, lax_op, rng_factory, shapes, dtypes,
                           test_autodiff, nondiff_argnums):
     if (jtu.device_under_test() == "cpu" and
@@ -337,7 +345,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
       return np.dstack(vals), np.dstack(derivs)
 
     self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, rtol=1e-5,
-                            atol=3e-3)
+                            atol=3e-3, check_dtypes=False)
     self._CompileAndCheck(lax_fun, args_maker, rtol=1E-5, atol=3e-3)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -370,9 +378,11 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
           a_normalized[m, l] = c2 * a[m, l]
       return a_normalized
 
-    self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, rtol=1e-5, atol=1e-5)
+    self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker,
+                            rtol=1e-5, atol=1e-5, check_dtypes=False)
     self._CompileAndCheck(lax_fun, args_maker, rtol=1E-6, atol=1E-6)
 
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmAccuracy(self):
     m = jnp.arange(-3, 3)[:, None]
     n = jnp.arange(3, 6)
@@ -386,6 +396,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
 
     self.assertAllClose(actual, expected, rtol=1e-8, atol=9e-5)
 
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmOrderZeroDegreeZero(self):
     """Tests the spherical harmonics of order zero and degree zero."""
     theta = jnp.array([0.3])
@@ -399,6 +410,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     self.assertAllClose(actual, expected, rtol=1.1e-7, atol=3e-8)
 
   @jtu.skip_on_devices("rocm")  # rtol and atol needs to be adjusted for ROCm
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmOrderZeroDegreeOne(self):
     """Tests the spherical harmonics of order one and degree zero."""
     theta = jnp.array([2.0])
@@ -411,6 +423,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
 
     self.assertAllClose(actual, expected, rtol=2e-7, atol=6e-8)
 
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmOrderOneDegreeOne(self):
     """Tests the spherical harmonics of order one and degree one."""
     theta = jnp.array([2.0])
@@ -425,11 +438,11 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     self.assertAllClose(actual, expected, rtol=1e-8, atol=6e-8)
 
   @parameterized.named_parameters(jtu.cases_from_list(
-      {'testcase_name': '_maxdegree={}_inputsize={}_dtype={}'.format(
-        l_max, num_z, dtype),
+      {'testcase_name': f'_maxdegree={l_max}_inputsize={num_z}_dtype={dtype.__name__}',
        'l_max': l_max, 'num_z': num_z, 'dtype': dtype}
       for l_max, num_z in zip([1, 3, 8, 10], [2, 6, 7, 8])
       for dtype in jtu.dtypes.all_integer))
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmForJitAndAgainstNumpy(self, l_max, num_z, dtype):
     """Tests against JIT compatibility and Numpy."""
     n_max = l_max
@@ -451,6 +464,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     with self.subTest('Test against numpy.'):
       self._CheckAgainstNumpy(osp_special.sph_harm, lsp_special_fn, args_maker)
 
+  @jax.numpy_dtype_promotion('standard')  # This test explicitly exercises dtype promotion
   def testSphHarmCornerCaseWithWrongNmax(self):
     """Tests the corner case where `n_max` is not the maximum value of `n`."""
     m = jnp.array([2])
@@ -492,7 +506,6 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
       for nonzero_condition_number in nonzero_condition_numbers
       for dtype in jtu.dtypes.inexact
       for seed in seeds))
-  @jtu.skip_on_devices("gpu")  # Fails on A100.
   def testPolar(
     self, n_zero_sv, degeneracy, geometric_spectrum, max_sv, shape, method,
       side, nonzero_condition_number, dtype, seed):
@@ -520,7 +533,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
       should_be_eye = np.matmul(unitary.conj().T, unitary)
     else:
       should_be_eye = np.matmul(unitary, unitary.conj().T)
-    tol = 500 * jnp.finfo(matrix.dtype).eps
+    tol = 500 * float(jnp.finfo(matrix.dtype).eps)
     eye_mat = np.eye(should_be_eye.shape[0], dtype=should_be_eye.dtype)
     with self.subTest('Test unitarity.'):
       self.assertAllClose(
@@ -534,7 +547,7 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     ev = ev[np.abs(ev) > tol * np.linalg.norm(posdef)]
     negative_ev = jnp.sum(ev < 0.)
     with self.subTest('Test positive definiteness.'):
-      assert negative_ev == 0.
+      self.assertEqual(negative_ev, 0)
 
     if side == "right":
       recon = jnp.matmul(unitary, posdef, precision=lax.Precision.HIGHEST)
@@ -546,20 +559,14 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
 
   @parameterized.named_parameters(jtu.cases_from_list(
     {'testcase_name':
-      '_linear_size_={}_seed={}_dtype={}_termination_size={}'.format(
-        linear_size, seed, jnp.dtype(dtype).name, termination_size
-      ),
-     'linear_size': linear_size, 'seed': seed, 'dtype': dtype,
+      '_linear_size={}_dtype={}_termination_size={}'.format(
+        linear_size, jnp.dtype(dtype).name, termination_size),
+     'linear_size': linear_size, 'dtype': dtype,
      'termination_size': termination_size}
     for linear_size in linear_sizes
-    for seed in seeds
-    for dtype in jtu.dtypes.floating
+    for dtype in jtu.dtypes.floating + jtu.dtypes.complex
     for termination_size in [1, 19]))
-  def test_spectral_dac_eigh(self, linear_size, seed, dtype, termination_size):
-    if jnp.dtype(dtype).name in ("bfloat16", "float16"):
-      if jtu.device_under_test() != "cpu":
-        raise unittest.SkipTest("Skip half precision off CPU.")
-
+  def test_spectral_dac_eigh(self, linear_size, dtype, termination_size):
     if jtu.device_under_test() != "tpu" and termination_size != 1:
       raise unittest.SkipTest(
           "Termination sizes greater than 1 only work on TPU")
@@ -569,16 +576,18 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     H = jnp.array(0.5 * (H + H.conj().T)).astype(dtype)
     if jnp.dtype(dtype).name in ("bfloat16", "float16"):
       self.assertRaises(
-        NotImplementedError, jax._src.lax.eigh.eigh, H)
+        NotImplementedError, lax_eigh.eigh, H)
       return
-    evs, V = jax._src.lax.eigh.eigh(H, termination_size=termination_size)
+    evs, V = lax_eigh.eigh(H, termination_size=termination_size)
     ev_exp, eV_exp = jnp.linalg.eigh(H)
     HV = jnp.dot(H, V, precision=lax.Precision.HIGHEST)
-    vV = evs[None, :] * V
+    vV = evs.astype(V.dtype)[None, :] * V
     eps = jnp.finfo(H.dtype).eps
     atol = jnp.linalg.norm(H) * eps
     self.assertAllClose(ev_exp, jnp.sort(evs), atol=20 * atol)
-    self.assertAllClose(HV, vV, atol=30 * atol)
+    self.assertAllClose(
+        HV, vV, atol=atol * (80 if jnp.issubdtype(dtype, jnp.complexfloating)
+                             else 30))
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": f"_{jtu.format_shape_dtype_string((n_obs, n_codes, *n_feats), dtype)}",

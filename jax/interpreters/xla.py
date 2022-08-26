@@ -80,7 +80,7 @@ def identity(x): return x
 _scalar_types = dtypes.python_scalar_dtypes.keys()
 
 def _make_array_shape(a: ShapedArray) -> Sequence[XlaShape]:
-  if a.dtype is dtypes.float0:
+  if a.dtype == dtypes.float0:
     return (xc.Shape.array_shape(np.dtype('bool'), a.shape),)
   else:
     return (xc.Shape.array_shape(a.dtype, a.shape),)
@@ -253,12 +253,15 @@ def _canonicalize_python_scalar_dtype(typ, x):
 
 canonicalize_dtype_handlers: Dict[Any, Callable] = {}
 for t in device_array.device_array_types:
-  canonicalize_dtype_handlers[t] = lambda x: x
+  canonicalize_dtype_handlers[t] = identity
 canonicalize_dtype_handlers.update(
     (t, _canonicalize_ndarray_dtype) for t in array_types)
 canonicalize_dtype_handlers.update(
     (t, partial(_canonicalize_python_scalar_dtype, t)) for t in _scalar_types)
-canonicalize_dtype_handlers[core.Token] = lambda x: x
+canonicalize_dtype_handlers[core.Token] = identity
+canonicalize_dtype_handlers[core.PaddedArray] = identity
+canonicalize_dtype_handlers[core.BInt] = \
+    lambda x: core.BInt(_canonicalize_python_scalar_dtype(int, x.val), x.bound)
 
 def abstractify(x) -> core.AbstractValue:
   typ = type(x)
@@ -272,11 +275,16 @@ def abstractify(x) -> core.AbstractValue:
   raise TypeError(f"Argument '{x}' of type '{type(x)}' is not a valid JAX type")
 
 def _make_abstract_python_scalar(typ, val):
-  return ShapedArray((), dtypes._scalar_type_to_dtype(typ, val), weak_type=True)
+  # Note: all python scalar types are weak except bool, because bool only
+  # comes in a single width.
+  return ShapedArray((), dtypes._scalar_type_to_dtype(typ, val),
+                     weak_type=typ is not bool)
 
 pytype_aval_mappings: Dict[Any, Callable[[Any], core.AbstractValue]] = {}
 for t in device_array.device_array_types:
   pytype_aval_mappings[t] = operator.attrgetter('aval')
+pytype_aval_mappings[core.BInt] = lambda x: core.AbstractBInt(x.bound)
+pytype_aval_mappings[core.PaddedArray] = operator.attrgetter('_aval')
 pytype_aval_mappings[core.Token] = lambda _: core.abstract_token
 pytype_aval_mappings.update((t, make_shaped_array) for t in array_types)
 pytype_aval_mappings.update(
@@ -461,9 +469,13 @@ def _pp_xla_call(eqn: core.JaxprEqn, context: core.JaxprPpContext,
                     k == 'backend' and v is not None or
                     k == 'device' and v is not None or
                     k == 'donated_invars' and any(v)}
-  return [pp.text(eqn.primitive.name),
-          core.pp_kv_pairs(sorted(printed_params.items()), context, settings),
-          pp.text(" ") + core.pp_vars(eqn.invars, context)]
+  annotation = (source_info_util.summarize(eqn.source_info)
+                if settings.source_info else None)
+  lhs = core.pp_vars(eqn.outvars, context, print_shapes=settings.print_shapes)
+  rhs = [pp.text(eqn.primitive.name),
+         core.pp_kv_pairs(sorted(printed_params.items()), context, settings),
+         pp.text(" ") + core.pp_vars(eqn.invars, context)]
+  return [lhs, pp.text(" = ", annotation=annotation), *rhs]
 core.pp_eqn_rules[xla_call_p] = _pp_xla_call
 
 

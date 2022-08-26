@@ -188,7 +188,6 @@ from jax.experimental.sparse.ad import (
     value_and_grad as value_and_grad,
 )
 from jax.experimental.sparse.bcoo import (
-    bcoo_add_batch_dim,  # TODO(jakevdp) remove this function
     bcoo_broadcast_in_dim as bcoo_broadcast_in_dim,
     bcoo_concatenate as bcoo_concatenate,
     bcoo_dot_general as bcoo_dot_general,
@@ -204,6 +203,7 @@ from jax.experimental.sparse.bcoo import (
     bcoo_update_layout as bcoo_update_layout,
     bcoo_reduce_sum as bcoo_reduce_sum,
     bcoo_reshape as bcoo_reshape,
+    bcoo_slice as bcoo_slice,
     bcoo_sort_indices as bcoo_sort_indices,
     bcoo_sort_indices_p as bcoo_sort_indices_p,
     bcoo_spdot_general_p as bcoo_spdot_general_p,
@@ -259,3 +259,5 @@ from jax.experimental.sparse.transform import (
     sparsify as sparsify,
     SparseTracer as SparseTracer,
 )
+
+from jax.experimental.sparse import linalg

@@ -215,7 +215,7 @@ subsequent method call may return an incorrect result::
 What's happening here? The issue is that ``static_argnums`` relies on the hash of the object
 to determine whether it has changed between calls, and the default ``__hash__`` method
 for a user-defined class will not take into account the values of class attributes. That means
-that on the second function call, JAX has no way of knowing that the class attribues have
+that on the second function call, JAX has no way of knowing that the class attributes have
 changed, and uses the cached static value from the previous compilation.
 
 For this reason, if you are marking ``self`` arguments as static, it is important that you
@@ -327,14 +327,17 @@ Let's first look at the principles of data and computation placement in JAX.
 
 In JAX, the computation follows data placement. JAX arrays
 have two placement properties: 1) the device where the data resides;
-and 2) whether it is **committed** to the device or not (the data is sometimes 
+and 2) whether it is **committed** to the device or not (the data is sometimes
 referred to as being *sticky* to the device).
 
 By default, JAX arrays are placed uncommitted on the default device
-(``jax.devices()[0]``), which is the first GPU by default. If no GPU is 
-present, ``jax.devices()[0]`` is the first CPU. The default device can 
-be set to "cpu" or "gpu" manually by setting the environment variable 
-``JAX_PLATFORM_NAME`` or the absl flag ``--jax_platform_name``.
+(``jax.devices()[0]``), which is the first GPU or TPU by default. If no GPU or
+TPU is present, ``jax.devices()[0]`` is the CPU. The default device can
+temporarily overridden with the :func:`jax.default_device` context manager, or
+set for the whole process by setting the environment variable ``JAX_PLATFORMS``
+or the absl flag ``--jax_platforms`` to "cpu", "gpu", or "tpu"
+(``JAX_PLATFORMS`` can also be a list of platforms, which determines which
+platforms are available in priority order).
 
 >>> from jax import numpy as jnp
 >>> print(jnp.ones(3).device_buffer.device())  # doctest: +SKIP
@@ -353,15 +356,15 @@ gpu:2
 
 Computations involving some committed inputs will happen on the
 committed device and the result will be committed on the
-same device. Invoking an operation on arguments that are committed 
+same device. Invoking an operation on arguments that are committed
 to more than one device will raise an error.
 
-You can also use :func:`jax.device_put` without a ``device`` parameter. If the data 
-is already on a device (committed or not), it's left as-is. If the data isn't on any 
-device—that is, it's a regular Python or NumPy value—it's placed uncommitted on the default 
+You can also use :func:`jax.device_put` without a ``device`` parameter. If the data
+is already on a device (committed or not), it's left as-is. If the data isn't on any
+device—that is, it's a regular Python or NumPy value—it's placed uncommitted on the default
 device.
 
-Jitted functions behave like any other primitive operations—they will follow the 
+Jitted functions behave like any other primitive operations—they will follow the
 data and will show errors if invoked on data committed on more than one device.
 
 ``jax.device_put(jnp.zeros(...), jax.devices()[1])`` or similar will actually create the
@@ -369,8 +372,8 @@ array of zeros on ``jax.devices()[1]``, instead of creating the array on the def
 device then moving it. This is thanks to some laziness in array creation, which holds
 for all the constant creation operations (``ones``, ``full``, ``eye``, etc).
 
-(As of April 2020, :func:`jax.jit` has a `device` parameter that affects the device 
-placement. That parameter is experimental, is likely to be removed or changed, 
+(As of April 2020, :func:`jax.jit` has a `device` parameter that affects the device
+placement. That parameter is experimental, is likely to be removed or changed,
 and its use is not recommended.)
 
 For a worked-out example, we recommend reading through
@@ -464,7 +467,7 @@ Broadly speaking:
   they are dispatched asynchronously (see :ref:`async-dispatch`); and they can
   be executed on CPU, GPU, or TPU, each of which have vastly different and continuously
   evolving performance characteristics.
-  
+
 These architectural differences make meaningful direct benchmark comparisons between
 NumPy and JAX difficult.
 
@@ -578,18 +581,28 @@ Buffer donation
 
 (This feature is implemented only for TPU and GPU.)
 
-When JAX executes a computation it reserves buffers on the device for all inputs and outputs.
-If you know than one of the inputs is not needed after the computation, and if it
+When JAX executes a computation it uses buffers on the device for all inputs and outputs.
+If you know that one of the inputs is not needed after the computation, and if it
 matches the shape and element type of one of the outputs, you can specify that you
 want the corresponding input buffer to be donated to hold an output. This will reduce
 the memory required for the execution by the size of the donated buffer.
+
+If you have something like the following pattern, you can use buffer donation::
+
+   params, state = jax.pmap(update_fn, donate_argnums=(0, 1))(params, state)
+
+You can think of this as a way to do a memory-efficient functional update
+on your immutable JAX arrays. Within the boundaries of a computation XLA can
+make this optimization for you, but at the jit/pmap boundary you need to
+guarantee to XLA that you will not use the donated input buffer after calling
+the donating function.
 
 You achieve this by using the `donate_argnums` parameter to the functions :func:`jax.jit`,
 :func:`jax.pjit`, and :func:`jax.pmap`. This parameter is a sequence of indices (0 based) into
 the positional argument list::
 
-    def add(x, y):
-      return x + y
+   def add(x, y):
+     return x + y
 
    x = jax.device_put(np.ones((2, 3)))
    y = jax.device_put(np.ones((2, 3)))
@@ -597,11 +610,16 @@ the positional argument list::
    # the same shape and type as `y`, so it will share its buffer.
    z = jax.jit(add, donate_argnums=(1,))(x, y)
 
+Note that this currently does not work when calling your function with key-word arguments!
+The following code will not donate any buffers::
+
+   params, state = jax.pmap(update_fn, donate_argnums=(0, 1))(params=params, state=state)
+
 If an argument whose buffer is donated is a pytree, then all the buffers
 for its components are donated::
 
-    def add_ones(xs: List[Array]):
-      return [x + 1 for x in xs]
+   def add_ones(xs: List[Array]):
+     return [x + 1 for x in xs]
 
    xs = [jax.device_put(np.ones((2, 3)), jax.device_put(np.ones((3, 4))]
    # Execute `add_ones` with donation of all the buffers for `xs`.
@@ -675,6 +693,86 @@ Additional reading:
   * `How to avoid NaN gradients when using where <https://github.com/tensorflow/probability/blob/master/discussion/where-nan.pdf>`_.
 
 
+Why are gradients zero for functions based on sort order?
+---------------------------------------------------------
+
+If you define a function that processes the input using operations that depend on
+the relative ordering of inputs (e.g. ``max``, ``greater``, ``argsort``, etc.) then
+you may be surprised to find that the gradient is everywhere zero.
+Here is an example, where we define `f(x)` to be a step function that returns
+`0` when `x` is negative, and `1` when `x` is positive::
+
+  import jax
+  import numpy as np
+  import jax.numpy as jnp
+
+  def f(x):
+    return (x > 0).astype(float)
+
+  df = jax.vmap(jax.grad(f))
+
+  x = jnp.array([-1.0, -0.5, 0.0, 0.5, 1.0])
+
+  print(f"f(x)  = {f(x)}")
+  # f(x)  = [0. 0. 0. 1. 1.]
+
+  print(f"df(x) = {df(x)}")
+  # df(x) = [0. 0. 0. 0. 0.]
+
+The fact that the gradient is everywhere zero may be confusing at first glance:
+after all, the output does change in response to the input, so how can the gradient
+be zero? However, zero turns out to be the correct result in this case.
+
+Why is this? Remember that what differentiation is measuring the change in ``f``
+given an infinitesimal change in ``x``. For ``x=1.0``, ``f`` returns ``1.0``.
+If we perturb ``x`` to make it slightly larger or smaller, this does not change
+the output, so by definition, :code:`grad(f)(1.0)` should be zero.
+This same logic holds for all values of ``f`` greater than zero: infinitessimally
+perturbing the input does not change the output, so the gradient is zero.
+Similarly, for all values of ``x`` less than zero, the output is zero.
+Perturbing ``x`` does not change this output, so the gradient is zero.
+That leaves us with the tricky case of ``x=0``. Surely, if you perturb ``x`` upward,
+it will change the output, but this is problematic: an infinitesimal change in ``x``
+produces a finite change inthe function value, which implies the gradient is
+undefined.
+Fortunately, there's another way for us to measure the gradient in this case: we
+perturb the function downward, in which case the output does not change, and so the
+gradient is zero.
+JAX and other autodiff systems tend to handle discontinuities in this way: if the
+positive gradient and negative gradient disagree, but one is defined and the other is
+not, we use the one that is defined.
+Under this definition of the gradient, mathematically and numerically the gradient of
+this function is everywhere zero.
+
+The problem stems from the fact that our function has a discontinuity at ``x = 0``.
+Our ``f`` here is essentially a `Heaviside Step Function`_, and we can use a
+`Sigmoid Function`_ as a smoothed replacement.
+The sigmoid is approximately equal to the heaviside function when `x` is far from zero,
+but replaces the discontinuity at ``x = 0`` with a smooth, differentiable curve.
+As a result of using :func:`jax.nn.sigmoid`, we get a similar computation with
+well-defined gradients::
+
+  def g(x):
+    return jax.nn.sigmoid(x)
+
+  dg = jax.vmap(jax.grad(g))
+
+  x = jnp.array([-10.0, -1.0, 0.0, 1.0, 10.0])
+
+  with np.printoptions(suppress=True, precision=2):
+    print(f"g(x)  = {g(x)}")
+    # g(x)  = [0.   0.27 0.5  0.73 1.  ]
+
+    print(f"dg(x) = {dg(x)}")
+    # dg(x) = [0.   0.2  0.25 0.2  0.  ]
+
+The :mod:`jax.nn` submodule also has smooth versions of other common rank-based
+functions, for example :func:`jax.nn.softmax` can replace uses of
+:func:`jax.numpy.argmax`, :func:`jax.nn.soft_sign` can replace uses of
+:func:`jax.numpy.sign`, :func:`jax.nn.softplus` can replace uses of
+:func:`jax.nn.relu`, etc.
+
+
 Additional Sections
 -------------------
 
@@ -683,3 +781,7 @@ Additional Sections
 ``Abstract tracer value encountered where concrete value is expected`` error
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 See :class:`jax.errors.ConcretizationTypeError`
+
+
+.. _Heaviside Step Function: https://en.wikipedia.org/wiki/Heaviside_step_function
+.. _Sigmoid Function: https://en.wikipedia.org/wiki/Sigmoid_function

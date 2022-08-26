@@ -58,7 +58,7 @@ from jax._src import test_util as jtu
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax import windowed_reductions as lax_windowed_reductions
 from jax._src.lib import xla_client
-
+from jax._src import random as jax_random
 
 FLAGS = config.FLAGS
 
@@ -828,7 +828,7 @@ for prim in [lax.argmin_p, lax.argmax_p]:
   for index_dtype in jtu.dtypes.all_integer + jtu.dtypes.all_unsigned:
     _make_argminmax_harness(prim, "index_dtype", index_dtype=index_dtype)
 
-      # Some special cases, with equal elements and NaN
+  # Some special cases, with equal elements and NaN
   for name, operand in [
       ("nan_0", np.array([np.nan, np.nan, 2., -2., -np.nan, -np.nan], np.float32)),
       ("nan_1", np.array([np.nan, -np.nan, 2., -2.], np.float32)),
@@ -1122,6 +1122,7 @@ for indices, index_oob, indices_name in [
     (np.array(2, dtype=np.int32), False, "1"),
     (np.array([2], dtype=np.int32), False, "2"),
     (np.array([2, 4], dtype=np.int32), False, "3"),
+    (np.array([2, 4], dtype=np.uint32), False, "3_uint32"),  # uint32 indices
     (np.array([[2, 4], [5, 6]], dtype=np.int32), False, "4"),
     (np.array([[0], [1], [10]], dtype=np.int32), True, "5_oob"), # Index out of bounds too high
     (np.array([[0, 1], [2, -1]], dtype=np.int32), False, "6_neg"), # Negative index is from the end
@@ -1647,9 +1648,8 @@ for dtype in jtu.dtypes.all_floating + jtu.dtypes.complex:
       define(
           lax.linalg.qr_p,
           f"multi_array_shape={jtu.format_shape_dtype_string(shape, dtype)}_fullmatrices={full_matrices}",
-          lax.linalg.qr,
-          [RandArg(shape, dtype),
-           StaticArg(full_matrices)],
+          partial(lax.linalg.qr, full_matrices=full_matrices),
+          [RandArg(shape, dtype)],
           # See jax._src.lib.lapack.geqrf for the list of compatible types
           jax_unimplemented=[
               Limitation(
@@ -1757,10 +1757,9 @@ for dtype in jtu.dtypes.all_inexact:
         define(
             lax.linalg.eig_p,
             f"shape={jtu.format_shape_dtype_string(shape, dtype)}_computelefteigenvectors={compute_left_eigenvectors}_computerighteigenvectors={compute_right_eigenvectors}",
-            lax.linalg.eig, [
+            partial(lax.linalg.eig, compute_left_eigenvectors=compute_left_eigenvectors, compute_right_eigenvectors=compute_right_eigenvectors),
+            [
                 RandArg(shape, dtype),
-                StaticArg(compute_left_eigenvectors),
-                StaticArg(compute_right_eigenvectors)
             ],
             jax_unimplemented=[
                 Limitation(
@@ -1794,8 +1793,7 @@ for dtype in jtu.dtypes.all_inexact:
           # Make operand lower/upper triangular
           lambda operand, lower, symmetrize_input: (lax.linalg.eigh(
               jnp.tril(operand)
-              if lower else jnp.triu(operand), lower, symmetrize_input)),
-          # lax.linalg.eigh,
+              if lower else jnp.triu(operand), lower=lower, symmetrize_input=symmetrize_input)),
           [
               CustomArg(
                   partial(_make_triangular_eigh_operand, shape, dtype, lower)),
@@ -2106,6 +2104,9 @@ for shape, start_indices, limit_indices in [
     ((5, 3), (1, 1), (3, 2)),
     ((7, 5, 3), (4, 0, 1), (7, 1, 3)),
     ((5, 3), (1, 1), (2, 1)),
+    ((3,), (np.array(1, np.uint32),), (np.array(2,
+                                                np.uint32),)),  # uint32 indices
+    ((3,), (np.array(1, np.uint8),), (np.array(2, np.uint8),)),  # uint8 indices
     # out-of-bounds cases, allowed for dynamic_slice
     ((5,), (-1,), (0,)),
     ((5,), (-1,), (1,)),
@@ -2158,6 +2159,8 @@ for shape, start_indices, update_shape in [
     ((3,), (1,), (1,)),
     ((5, 3), (1, 1), (3, 1)),
     ((7, 5, 3), (4, 1, 0), (2, 0, 1)),
+    ((3,), (np.array(1, np.uint32),), (1,)),  # uint32 indices
+    ((3,), (np.array(1, np.uint8),), (1,)),  # uint8 indices
     ((3,), (-1,), (1,)),  # out-of-bounds
     ((3,), (10,), (1,)),  # out-of-bounds
     ((3,), (10,), (2,)),  # out-of-bounds
@@ -2381,14 +2384,14 @@ for dtype in jtu.dtypes.all:
                            dtype=dtype)
     # Test the dimensions, but only for int32 (to keep the # of tests small)
     if dtype == np.int32:
-        _make_reduce_harness(name, nr_operands=nr_operands,
-                             computation=computation, init_value=init_value,
-                             dimensions=(1,),
-                             dtype=dtype)
-        _make_reduce_harness(name, nr_operands=nr_operands,
-                             computation=computation, init_value=init_value,
-                             dimensions=(0, 1),
-                             dtype=dtype)
+      _make_reduce_harness(name, nr_operands=nr_operands,
+                           computation=computation, init_value=init_value,
+                           dimensions=(1,),
+                           dtype=dtype)
+      _make_reduce_harness(name, nr_operands=nr_operands,
+                           computation=computation, init_value=init_value,
+                           dimensions=(0, 1),
+                           dtype=dtype)
 
 def _make_reduce_window_harness(name,
                                 *,
@@ -2401,10 +2404,9 @@ def _make_reduce_window_harness(name,
                                 window_strides=(1, 1),
                                 dtype=np.float32,
                                 padding=((0, 0), (0, 0)),
-                                requires_xla=True):
+                                requires_xla=False):
   prim_name = f"reduce_window_{computation.__name__}"
   limitations = []
-
   xla_opts = [True] if requires_xla else [True, False]
 
   for enable_xla in xla_opts:
@@ -2436,6 +2438,18 @@ def _make_reduce_window_harness(name,
         window_dilation=window_dilation,
         enable_xla=enable_xla)
 
+def requires_xla_for_reduce(name, dtype):
+  if name not in ["min", "max", "add"]:
+    return True
+  if name in ["min", "max"] and dtype in [
+      np.bool_, np.uint32, np.uint64, np.complex64, np.complex128
+  ]:
+    return True
+  if name == "min" and dtype in [np.uint8, np.uint16]:
+    return True
+  if name == "add" and dtype not in [np.float16, np.float32, np.float64]:
+    return True
+  return False
 
 # Validate dtypes across all execution paths
 # This first harness runs the tests for all dtypes using default values for
@@ -2443,42 +2457,53 @@ def _make_reduce_window_harness(name,
 # several execution paths. Variations of other parameters can thus safely
 # skip testing their corresponding default value.
 for dtype in jtu.dtypes.all:
-  for computation, init_value, requires_xla in [
-      (lax.min, _get_min_identity(dtype), True),  # path through reduce_window_min
-      (lax.max, _get_max_identity(dtype), False),  # path through TF reduce_window_max
-      (lax.max, 1, True),  # path through reduce_window
-      (lax.add, 0, False),  # path_through reduce_window_sum
-      (lax.add, 1, True),  # path through reduce_window
-      (lax.mul, 0, True),  # path through reduce_window
-      (lax.mul, 1, True),  # path through reduce_window
-      (lax.mul, 2, True),  # path through reduce_window
+  for computation, init_value in [
+      (lax.min, _get_min_identity(dtype)),  # path through reduce_window_min
+      (lax.max, _get_max_identity(dtype)),  # path through TF reduce_window_max
+      (lax.max, 1),  # path through reduce_window
+      (lax.add, 0),  # path_through reduce_window_sum
+      (lax.add, 1),  # path through reduce_window
+      (lax.mul, 0),  # path through reduce_window
+      (lax.mul, 1),  # path through reduce_window
+      (lax.mul, 2),  # path through reduce_window
   ]:
-    if dtype == np.bool_ and (computation in [lax.add, lax.mul]):
+    if dtype == np.bool_ and computation in [lax.add, lax.mul]:
       continue
     _make_reduce_window_harness(
-        "dtypes", dtype=dtype, computation=computation, init_value=init_value)
+        "dtypes",
+        dtype=dtype,
+        computation=computation,
+        init_value=init_value,
+        requires_xla=requires_xla_for_reduce(computation.__name__, dtype))
+
 # Validate window_dimensions
 _make_reduce_window_harness("window_dimensions", window_dimensions=(1, 1))
 # Validate window_strides
 _make_reduce_window_harness("window_strides", window_strides=(1, 2))
 # Validate padding
-_make_reduce_window_harness("padding", padding=((1, 2), (0, 3)))
+_make_reduce_window_harness("padding", padding=((1, 2), (0, 3)),
+                            requires_xla=True)
 # Validate base_dilation
-_make_reduce_window_harness("base_dilation", base_dilation=(1, 2))
+_make_reduce_window_harness("base_dilation", base_dilation=(1, 2),
+                            requires_xla=True)
 # Validate window_dilation
 _make_reduce_window_harness("window_dilation", window_dilation=(1, 2))
-# Validate squeezing behavior and dimensions in tf.nn.max_pool
-for shape, window_dimensions in [
-    ((2,), (2,)),  # 1 spatial dimension, left and right squeeze
-    ((2, 1), (2, 1)),  # 1 spatial dimension, left squeeze
-    ((1, 2), (1, 2)),  # 1 spatial dimension, right squeeze
-    ((1, 2, 1), (1, 2, 1)),  # 1 spatial dimension no squeeze
-    ((2, 4), (2, 2)),  # 2 spatial dimensions, left and right squeeze
-    ((2, 4, 3), (2, 2, 2)),  # 3 spatial dimensions, left and right squeeze
-    ((1, 4, 3, 2, 1), (1, 2, 2, 2, 1))  # 3 spatial dimensions, no squeeze
+# Validate batch and channel dimensions behavior. lax.reduce_window accepts
+# inputs that either have or do not have batch and channel dimensions.
+# N=batch, DHW=spatial, C=channel.
+# Without XLA only supports 1D/2D reductions.
+for shape, window_dimensions, requires_xla in [
+    ((2,), (2,), False),  # W
+    ((2, 1), (2, 1), False),  # WC
+    ((1, 2), (1, 2), False),  # NW
+    ((1, 2, 1), (1, 2, 1), False),  # NWC
+    ((2, 4), (2, 2), False),  # HW
+    ((1, 2, 4, 1), (1, 2, 2, 1), False),  # NHWC
+    ((2, 4, 3), (2, 2, 2), True),  # DHW
+    ((1, 4, 3, 2, 1), (1, 2, 2, 2, 1), True)  # NDHWC
 ]:
   _make_reduce_window_harness(
-      "squeeze_dim",
+      "batch_channel_dims",
       computation=lax.max,
       shape=shape,
       dtype=np.float32,
@@ -2487,17 +2512,42 @@ for shape, window_dimensions in [
       window_dilation=tuple([1] * len(shape)),
       padding=tuple([(0, 0)] * len(shape)),
       window_strides=tuple([1] * len(shape)),
-      window_dimensions=window_dimensions)
+      window_dimensions=window_dimensions,
+      requires_xla=requires_xla)
 
-# This corresponds to SAME padding.
+for computation, id_value in [(lax.max, _get_max_identity(np.float32)),
+                              (lax.min, _get_min_identity(np.float32)),
+                              (lax.add, 0.)]:
+  _make_reduce_window_harness(
+      "same_padding",
+      shape=(112, 112),
+      init_value=id_value,
+      computation=computation,
+      window_dimensions=(3, 3),
+      window_strides=(2, 2),
+      padding="SAME")
+
+# A few additional test cases for manual padding, which is applied when calling
+# reduce_window with lax.add, SAME padding and window_dimensions != (1, 1, ...).
+for window_dimensions, window_strides in [((2, 2), (1, 1)), ((3, 3), (2, 2)),
+                                          ((13, 13), (5, 6))]:
+  _make_reduce_window_harness(
+      "manual_padding",
+      shape=(12, 12),
+      init_value=0.,
+      computation=lax.add,
+      window_dimensions=window_dimensions,
+      window_strides=window_strides,
+      padding="SAME")
+
 _make_reduce_window_harness(
-    "same_padding",
-    shape=(112, 112),
-    init_value=-np.inf,
-    computation=lax.max,
-    window_dimensions=(3, 3),
-    window_strides=(2, 2),
-    padding=((0, 1), (0, 1)),
+    "init_value_1d",
+    shape=(1, 16000),
+    init_value=1.0,
+    computation=lax.min,
+    window_dimensions=[1, 401],
+    window_strides=[1, 160],
+    padding="VALID",
     requires_xla=False)
 
 def _make_reducer_harness(prim,
@@ -2535,7 +2585,7 @@ for dtype in (np.float32, np.float64):
     define(
         "random_gamma",
         f"shape={jtu.format_shape_dtype_string(shape, dtype)}",
-        jax.jit(jax._src.random.gamma),
+        jax.jit(jax_random.gamma),
         [np.array([42, 43], dtype=np.uint32),
          RandArg(shape, dtype)],
         dtype=dtype)
@@ -2883,8 +2933,19 @@ for batch_group_count, feature_group_count in [
         feature_group_count=feature_group_count,
         batch_group_count=batch_group_count)
 
+#--- BEGIN Tests for conv_general_dilated with works_without_xla=True ---
 
-#--- BEGIN Tests for conv_general_dilated with works_for_xla=True ---
+# Validate Conv1D.
+_make_conv_harness(
+    "conv1d",
+    lhs_shape=(2, 3, 10),
+    rhs_shape=(3, 3, 5),
+    window_strides=(1,),
+    padding=((0, 0),),
+    lhs_dilation=(1,),
+    rhs_dilation=(1,),
+    dimension_numbers=("NCH", "OIH", "NCH"),
+    works_without_xla=True)
 
 
 # feature_group_count is supported for enable_xla=False only if we are doing a
@@ -2896,6 +2957,39 @@ _make_conv_harness(
     lhs_shape=(2, 3, 9, 9),  # "NCHW": in_channels == 3
     rhs_shape=(12, 1, 3, 3),  # "OIHW": channel_multiplier = 12/3 = 4
     feature_group_count=3,
+    works_without_xla=True)
+
+_make_conv_harness(
+    "depthwise2d_dilated",
+    lhs_shape=(2, 3, 9, 9),  # "NCHW": in_channels == 3
+    rhs_shape=(12, 1, 3, 3),  # "OIHW": channel_multiplier = 12/3 = 4
+    feature_group_count=3,
+    lhs_dilation=(1, 1),
+    rhs_dilation=(2, 1),
+    works_without_xla=True)
+
+_make_conv_harness(
+    "depthwise1d",
+    lhs_shape=(2, 3, 9),  # "NCH": in_channels == 3
+    rhs_shape=(12, 1, 3),  # "OIH": channel_multiplier = 12/3 = 4
+    feature_group_count=3,
+    lhs_dilation=(1,),
+    rhs_dilation=(1,),
+    window_strides=(1, ),
+    padding=((0, 0),),
+    dimension_numbers=("NCH", "OIH", "NCH"),
+    works_without_xla=True)
+
+_make_conv_harness(
+    "depthwise1d_dilated",
+    lhs_shape=(2, 3, 9),  # "NCH": in_channels == 3
+    rhs_shape=(12, 1, 3),  # "OIH": channel_multiplier = 12/3 = 4
+    feature_group_count=3,
+    lhs_dilation=(1,),
+    rhs_dilation=(2,),
+    window_strides=(1,),
+    padding=((0, 0),),
+    dimension_numbers=("NCH", "OIH", "NCH"),
     works_without_xla=True)
 
 # Validate variations of window_strides
@@ -2930,6 +3024,39 @@ _make_conv_harness(
     window_strides=(1, 1),
     lhs_dilation=(2, 2),
     padding=((1, 1), (2, 2)),
+    dimension_numbers=("NHWC", "HWIO", "NHWC"),
+    works_without_xla=True)
+
+# Simulate a call from lax.conv_transpose.
+_make_conv_harness(
+    "conv_tranpose1d_valid_padding",
+    lhs_shape=(1, 16, 2),
+    rhs_shape=(3, 2, 2),
+    window_strides=(1,),
+    lhs_dilation=(2,),
+    rhs_dilation=(1,),
+    padding=((2, 2), ),
+    dimension_numbers=("NHC", "HIO", "NHC"),
+    works_without_xla=True)
+
+_make_conv_harness(
+    "conv_tranpose1d_same_padding",
+    lhs_shape=(1, 16, 2),
+    rhs_shape=(3, 2, 2),
+    window_strides=(1,),
+    lhs_dilation=(2,),
+    rhs_dilation=(1,),
+    padding=((2, 1), ),
+    dimension_numbers=("NHC", "HIO", "NHC"),
+    works_without_xla=True)
+
+_make_conv_harness(
+    "conv_tranpose2d_same_padding",
+    lhs_shape=(1, 16, 16, 2),
+    rhs_shape=(2, 3, 2, 2),
+    window_strides=(1, 1),
+    lhs_dilation=(2, 2),
+    padding=((1, 1), (2, 1)),
     dimension_numbers=("NHWC", "HWIO", "NHWC"),
     works_without_xla=True)
 
@@ -3002,19 +3129,6 @@ for padding, lhs_dilation, rhs_dilation in [
         rhs_dilation=rhs_dilation,
         works_without_xla=True)
 
-#--- END Tests for conv_general_dilated with works_for_xla=True ---
-
-
-for lhs_dilation, rhs_dilation in [
-    # Note: LHS dilation does work for enable_xla=False, but only if
-    # padding=='VALID' (see test above for conv_transpose2d_valid_padding).
-    ((2, 2), (1, 1)),  # dilation only on LHS (transposed)
-    ((2, 3), (3, 2))   # dilation on both LHS and RHS (transposed & atrous)
-]:
-  _make_conv_harness(
-      "dilations", lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation)
-
-
 for padding, lhs_dilation, rhs_dilation in [
     ("VALID", (1,), (1,)),  # no dilation with "VALID" padding
     ("SAME", (1,), (1,)),  # no dilation with "SAME" padding
@@ -3032,7 +3146,19 @@ for padding, lhs_dilation, rhs_dilation in [
         dimension_numbers=dimension_numbers,
         window_strides=(1,),
         lhs_dilation=lhs_dilation,
-        rhs_dilation=rhs_dilation)
+        rhs_dilation=rhs_dilation,
+        works_without_xla=True)
+
+#--- END Tests for conv_general_dilated with works_without_xla=True ---
+
+for lhs_dilation, rhs_dilation in [
+    # Note: LHS dilation does work for enable_xla=False, but only if
+    # padding=='VALID' (see test above for conv_transpose2d_valid_padding).
+    ((2, 2), (1, 1)),  # dilation only on LHS (transposed)
+    ((2, 3), (3, 2))   # dilation on both LHS and RHS (transposed & atrous)
+]:
+  _make_conv_harness(
+      "dilations", lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation)
 
 
 for padding, lhs_dilation, rhs_dilation in [

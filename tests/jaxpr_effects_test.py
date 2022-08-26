@@ -20,19 +20,22 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
-from jax import ad_checkpoint
 from jax import core
 from jax import lax
 from jax import linear_util as lu
 from jax.config import config
+from jax.interpreters import ad
 from jax.experimental import maps
 from jax.experimental import pjit
+from jax.experimental import sharding
 from jax.interpreters import mlir
+from jax._src import ad_checkpoint
 from jax._src import lib as jaxlib
 from jax._src import dispatch
 from jax._src import test_util as jtu
 from jax._src import util
 from jax._src.lax import control_flow as lcf
+from jax._src.lib import can_execute_with_token
 import numpy as np
 
 config.parse_flags_with_absl()
@@ -41,8 +44,12 @@ effect_p = core.Primitive('effect')
 effect_p.multiple_results = True
 
 @effect_p.def_effectful_abstract_eval
-def _(*, effect):
-  return [], {effect}
+def _(*avals, effect):
+  return avals, {effect}
+
+def effect_jvp_rule(primals, tangents, effect):
+  return effect_p.bind(*primals, effect=effect), tangents
+ad.primitive_jvps[effect_p] = effect_jvp_rule
 
 mlir.lowerable_effects.add('foo')
 mlir.lowerable_effects.add('foo2')
@@ -58,6 +65,14 @@ core.ordered_effects.add('while2')
 lcf.allowed_effects.add('while')
 lcf.allowed_effects.add('while1')
 lcf.allowed_effects.add('while2')
+
+ad_checkpoint.remat_allowed_effects.add('remat')
+
+# TODO(sharadmv): remove jaxlib guards for TPU tests when jaxlib minimum
+#                 version is >= 0.3.15
+disabled_backends = []
+if jaxlib.version < (0, 3, 15):
+  disabled_backends.append('tpu')
 
 
 def trivial_effect_lowering(ctx, *, effect):
@@ -102,23 +117,16 @@ def _(*avals, callback, out_avals, effect):
 
 def callback_effect_lowering(ctx: mlir.LoweringRuleContext, *args, callback, out_avals, effect):
   del out_avals
+  token_in = None
   if effect in core.ordered_effects:
-    def _token_callback(token, *args):
-      out = callback(*args)
-      flat_out = jax.tree_util.tree_leaves(out)
-      return (token, *flat_out)
     token_in = ctx.tokens_in.get(effect)[0]
-    (token_out, *out_op), keep_alive = mlir.emit_python_callback(
-        ctx.module_context.platform, _token_callback,
-        [token_in, *args], [core.abstract_token, *ctx.avals_in],
-        [core.abstract_token, *ctx.avals_out], True)
+
+  out_op, token_out, keep_alive = mlir.emit_python_callback(
+      ctx, callback, token_in, list(args), list(ctx.avals_in),
+      list(ctx.avals_out), True)
+  if token_out:
     ctx.set_tokens_out(ctx.tokens_in.update_tokens(mlir.TokenSet({effect:
       token_out})))
-  else:
-    out_op, keep_alive = mlir.emit_python_callback(
-        ctx.module_context.platform, callback,
-        list(args), list(ctx.avals_in),
-        list(ctx.avals_out), True)
   ctx.module_context.add_keepalive(keep_alive)
   return out_op
 
@@ -190,8 +198,7 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
         effect_p.bind(effect='bar')
         return [x]
       return core.call(f_, x)[0]
-    with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
-      jax.make_jaxpr(f)(2.)
+    jax.make_jaxpr(f)(2.)
 
   def test_xla_call_primitive_inherits_effects(self):
 
@@ -200,8 +207,7 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
       effect_p.bind(effect='foo')
       effect_p.bind(effect='bar')
       return x
-    with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
-      jax.make_jaxpr(f)(2.)
+    jax.make_jaxpr(f)(2.)
 
   @parameterized.named_parameters(jtu.cases_from_list(
     dict(testcase_name=f"_{flavor}", flavor=flavor)
@@ -211,11 +217,20 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
 
     @remat
     def f(x):
-      effect_p.bind(effect='foo')
-      effect_p.bind(effect='bar')
+      x, = effect_p.bind(x, effect='foo')
+      x, = effect_p.bind(x, effect='bar')
       return x
-    with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
-      jax.make_jaxpr(f)(2.)
+    jax.make_jaxpr(f)(2.)
+    with self.assertRaisesRegex(NotImplementedError, "Effects not supported"):
+      jax.make_jaxpr(lambda x: jax.linearize(f, x)[1](x))(2.)
+
+  def test_new_remat_allows_certain_effects(self):
+    @ad_checkpoint.checkpoint
+    def f(x):
+      x, = effect_p.bind(x, effect='remat')
+      return x
+    jaxpr = jax.make_jaxpr(f)(2.)
+    self.assertSetEqual(jaxpr.effects, {"remat"})
 
   def test_custom_jvp_primitive_inherits_effects(self):
 
@@ -254,25 +269,32 @@ class HigherOrderPrimitiveTest(jtu.JaxTestCase):
       jax.make_jaxpr(f)(jnp.arange(jax.local_device_count()))
 
   def test_xmap_inherits_effects(self):
+    if config.jax_array:
+      raise unittest.SkipTest('Xmap does not work properly with Arrays '
+                              'containing SingleDeviceSharding.')
 
     def f(x):
       effect_p.bind(effect='foo')
       effect_p.bind(effect='bar')
       return x
     f = maps.xmap(f, in_axes=['a'], out_axes=['a'])
-    with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
-      jax.make_jaxpr(f)(jnp.arange(jax.local_device_count()))
+    jaxpr = jax.make_jaxpr(f)(jnp.arange(jax.local_device_count()))
+    self.assertSetEqual(jaxpr.effects, {"foo", "bar"})
 
   def test_pjit_inherits_effects(self):
     def f(x):
       effect_p.bind(effect='foo')
       effect_p.bind(effect='bar')
       return x
-    f = pjit.pjit(f, in_axis_resources=pjit.PartitionSpec('x'),
-        out_axis_resources=pjit.PartitionSpec('x'))
+    mesh = maps.Mesh(np.array(jax.devices()), ['x'])
+    if config.jax_array:
+      spec = sharding.MeshPspecSharding(mesh, pjit.PartitionSpec('x'))
+    else:
+      spec = pjit.PartitionSpec('x')
+    f = pjit.pjit(f, in_axis_resources=spec, out_axis_resources=spec)
     with self.assertRaisesRegex(NotImplementedError, 'Effects not supported'):
-      with maps.Mesh(np.array(jax.devices()), ['x']):
-        jax.make_jaxpr(f)(jnp.arange(jax.local_device_count()))
+      with mesh:
+        jax.make_jaxpr(f)(np.arange(jax.local_device_count()))
 
 
 class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
@@ -291,6 +313,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
       ctx.set_tokens_out(ctx.tokens_in)
       return []
     mlir.register_lowering(effect_p, _effect_lowering)
+    jax.effects_barrier()
     dispatch.runtime_tokens.clear()
 
   def tearDown(self):
@@ -452,10 +475,14 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
 
     # First output should be output token
     result_types = mhlo.body.operations[0].type.results
-    self.assertLen(list(result_types), 2)
-    self.assertEqual(str(result_types[0]), 'tensor<0xi1>')
-    self.assertLen(list(result_types), 2)
-    self.assertEqual(str(result_types[1]), 'tensor<f32>')
+    if not can_execute_with_token:
+      self.assertLen(list(result_types), 2)
+      self.assertEqual(str(result_types[0]), 'tensor<0xi1>')
+      self.assertLen(list(result_types), 2)
+      self.assertEqual(str(result_types[1]), 'tensor<f32>')
+    else:
+      self.assertLen(list(result_types), 1)
+      self.assertEqual(str(result_types[0]), 'tensor<f32>')
 
   def test_lowered_jaxpr_with_ordered_effects_takes_in_dummy_inputs(self):
     @jax.jit
@@ -526,7 +553,7 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
     @jax.pmap
     def f(x):
       effect_p.bind(effect='foo')
-      return x + 1.
+      return x + 1
     with self.assertRaisesRegex(
         ValueError,
         "Ordered effects not supported for map primitives: {'foo'}"):
@@ -570,13 +597,10 @@ class EffectfulJaxprLoweringTest(jtu.JaxTestCase):
 
 class EffectOrderingTest(jtu.JaxTestCase):
 
-  @jtu.skip_on_devices("tpu", "gpu")
+  @jtu.skip_on_devices(*disabled_backends)
   def test_can_execute_python_callback(self):
-    # TODO(sharadmv): remove jaxlib check when minimum version is bumped
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
-    if jaxlib.version < (0, 3, 8):
-      raise unittest.SkipTest("`emit_python_callback` only supported in jaxlib >= 0.3.8")
     log = []
     def log_value(x):
       log.append(x)
@@ -587,18 +611,16 @@ class EffectOrderingTest(jtu.JaxTestCase):
       return callback_p.bind(x, callback=log_value, effect='log', out_avals=[])
 
     f(2.)
+    jax.effects_barrier()
     self.assertListEqual(log, [2.])
     f(3.)
+    jax.effects_barrier()
     self.assertListEqual(log, [2., 3.])
-    dispatch.runtime_tokens.block_until_ready()
 
-  @jtu.skip_on_devices("tpu", "gpu")
+  @jtu.skip_on_devices(*disabled_backends)
   def test_ordered_effect_remains_ordered_across_multiple_devices(self):
-    # TODO(sharadmv): remove jaxlib check when minimum version is bumped
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
-    if jaxlib.version < (0, 3, 8):
-      raise unittest.SkipTest("`emit_python_callback` only supported in jaxlib >= 0.3.8")
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
     log = []
@@ -623,18 +645,14 @@ class EffectOrderingTest(jtu.JaxTestCase):
     g(3.)
     f(jnp.ones((500, 500)))
     g(3.)
-    dispatch.runtime_tokens.block_until_ready()
+    jax.effects_barrier()
     x_, y_ = float(jnp.log(1.25e8)), 3.
     expected_log = [x_, y_, x_, y_, x_, y_]
     self.assertListEqual(log, expected_log)
 
-  @jtu.skip_on_devices("tpu", "gpu")
+  @jtu.skip_on_devices("tpu")
+  @jtu.skip_on_devices(*disabled_backends)
   def test_different_threads_get_different_tokens(self):
-    # TODO(sharadmv): remove jaxlib check when minimum version is bumped
-    # TODO(sharadmv): enable this test on GPU and TPU when backends are
-    # supported
-    if jaxlib.version < (0, 3, 8):
-      raise unittest.SkipTest("`emit_python_callback` only supported in jaxlib >= 0.3.8")
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
     tokens = []
@@ -685,13 +703,10 @@ class ParallelEffectsTest(jtu.JaxTestCase):
       return x
     jax.pmap(f)(jnp.arange(jax.local_device_count()))
 
-  @jtu.skip_on_devices("tpu", "gpu")
+  @jtu.skip_on_devices(*disabled_backends)
   def test_can_pmap_unordered_callback(self):
-    # TODO(sharadmv): remove jaxlib check when minimum version is bumped
     # TODO(sharadmv): enable this test on GPU and TPU when backends are
     # supported
-    if jaxlib.version < (0, 3, 8):
-      raise unittest.SkipTest("`emit_python_callback` only supported in jaxlib >= 0.3.8")
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
     log = set()
@@ -731,6 +746,52 @@ class ControlFlowEffectsTest(jtu.JaxTestCase):
         return x
       return lax.cond(x, true_fun, false_fun, x)
     f(2)
+
+  def test_allowed_effect_in_cond_jvp(self):
+    def f(x):
+      def true_fun(x):
+        effect_p.bind(effect='while')
+        return x
+      def false_fun(x):
+        effect_p.bind(effect='while')
+        return x
+      return lax.cond(True, true_fun, false_fun, x)
+
+    # test primal side gets effect
+    primal_jaxpr = jax.make_jaxpr(lambda x: jax.linearize(f, x)[0])(2.)
+    self.assertEqual(primal_jaxpr.effects, {'while'})
+    # and tangent side does not
+    _, f_lin = jax.linearize(f, 2.)
+    lin_jaxpr = f_lin.func.fun.args[0]
+    self.assertEqual(lin_jaxpr.effects, set())
+
+  def test_allowed_effect_in_cond_jvp2(self):
+    @jax.custom_jvp
+    def print_tangents(x):
+      return x
+    @print_tangents.defjvp
+    def foo_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      # TODO(mattjj,sharadmv): don't require data dependence for jax.linearize!
+      # effect_p.bind(t, effect='while')
+      t, = effect_p.bind(t, effect='while')  # data dep only on tangents
+      return x, t
+
+    def f(x):
+      def true_fun(x):
+        return print_tangents(x)
+      def false_fun(x):
+        return print_tangents(x)
+      return lax.cond(True, true_fun, false_fun, x)
+
+    # test primal side does not get effect
+    primal_jaxpr = jax.make_jaxpr(lambda x: jax.linearize(f, x)[0])(2.)
+    self.assertEqual(primal_jaxpr.effects, set())
+    # and tangent side does
+    _, f_lin = jax.linearize(f, 2.)
+    lin_jaxpr = f_lin.func.fun.args[0]
+    self.assertEqual(lin_jaxpr.effects, {'while'})
 
   def test_allowed_ordered_effect_in_cond(self):
     def f(x):
